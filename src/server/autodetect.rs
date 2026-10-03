@@ -171,7 +171,7 @@ fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<(
     }
 
     let requirement = if saved_federation && !surface_interest {
-        "saved SSH machines require surface lifecycle support"
+        "saved machines require surface lifecycle support"
     } else {
         "the stable endpoint generation is incompatible"
     };

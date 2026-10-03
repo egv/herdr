@@ -84,6 +84,54 @@ Requests and responses travel through the JSON API over non-interactive SSH; API
 
 Local pane IDs are not inherited by remote commands. Use explicit remote IDs; `--current` cannot refer to the caller's local pane. Remote worktree paths must be absolute, `~`, or start with `~/` (expanded on the server); plugin link paths must be absolute. The prefix targets one machine at a time; combined listings and routing through another TUI's connections are not included.
 
+## Dial-in machines
+
+On the hub, the Linux or macOS machine whose Herdr client shows the dial-in machine:
+
+```bash
+herdr machine add --dial-in --label <label> [--remote-session <name>] [--hub <ssh-target>] [--agent-forwarding] [--authorize-key -] [--json]
+herdr machine authorize <label-or-id> '<public key line>' [--herdr-path <path>] [--write [--authorized-keys <path>] [--replace]]
+herdr machine agent-forwarding <label-or-id> on|off
+herdr machine update <label-or-id> [--yes] [--restart-server]
+herdr machine reconnect <label-or-id> [--wait <seconds>]
+herdr machine remove <profile-id> [--revoke [--authorized-keys <path>]]
+```
+
+On the machine that dials in:
+
+```bash
+herdr machine dial setup <name> --hub <ssh-target> --pair [--label <label>] [--remote-session <name>] [--agent-forwarding] [--hub-herdr <path>] [--identity <path>] [--no-compression]
+herdr machine dial setup <name> --hub <ssh-target> --link <id> [--identity <path>] [--no-compression]
+herdr machine dial run <name>
+herdr machine dial list [--json]
+herdr machine dial status [<name>] [--json]
+herdr machine dial remove <name>
+herdr machine dial service install <name> [--no-start] [--herdr-path <path>]
+herdr machine dial service uninstall <name>
+herdr machine dial service status <name> [--json]
+```
+
+`machine add --dial-in` saves a machine that connects to this hub over SSH by itself and prints its `dial setup` command; `--hub` is the SSH target that machine uses to reach the hub. `--authorize-key -` reads the machine's public key line from stdin and adds it to `~/.ssh/authorized_keys`; if that fails, the machine is not saved. `--json` prints `id`, `label`, `session`, `authorized_keys_path`, and `herdr_version`. `dial setup --pair` runs that command through your interactive SSH login to the hub and saves the returned link ID; `--agent-forwarding` passes the same flag to it, and `--hub-herdr` sets the hub's Herdr path when `herdr` is not on its non-interactive `PATH`. `dial setup --link` saves a link ID printed by the hub and prints the `machine authorize` command to run there. Both generate an ed25519 key for the link unless `--identity` is given.
+
+`machine authorize` prints the restricted `authorized_keys` line on stdout and guidance on stderr, or adds the line with `--write`. It refuses a key that is already authorized and replaces the machine's existing line only with `--replace`. `--herdr-path` sets the executable sshd runs; the default is this executable, or a stable launcher when it lives in a versioned package directory. `machine remove --revoke` also deletes the machine's line, and leaves the machine saved if that fails.
+
+`machine list`, `status`, `rename`, `enable`, `disable`, and the `--machine` prefix accept dial-in machines, and JSON rows include `kind` (`ssh` or `dial-in`). `machine reconnect` cannot start a dial-in connection; it waits for the machine, 30 seconds by default, and exits 1 if it does not connect. `machine update` installs this hub's version on a connected machine whose Herdr supports hub updates, then waits for it to reconnect; pass `--yes` without an interactive terminal. For a machine on another platform, a hub built from source needs `HERDR_REMOTE_BINARY` pointing at a build for that platform. `--restart-server` then restarts the machine's server, stopping its panes. `machine agent-forwarding` applies only to dial-in machines.
+
+`dial run` keeps the link open in the foreground until Ctrl-C. `dial service` manages a systemd user unit (`herdr-dial@<name>.service`) on Linux or a launchd agent (`dev.herdr.dial.<name>`) on macOS; `install` removes the unit it wrote when enabling or starting it fails (on macOS, a reinstall puts back and restarts the agent it replaced), and keeps the installing shell's `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, and `PATH`. `dial status` without a name uses the only link. `dial remove` deletes a link's configuration and generated key, and refuses while the link is running or its service is installed. See [Machines that dial in](/docs/connecting-machines/#machines-that-dial-in) for pairing, services, agent forwarding, updates, and the security model.
+
+On another computer that reaches the hub over SSH, a relay makes the hub's dial-in machines available as `<relay>/<machine>`:
+
+```bash
+herdr machine relay add <ssh-target> [--label <label>]
+herdr machine relay list [--json]
+herdr machine relay rename <relay> --label <label>
+herdr machine relay enable <relay>
+herdr machine relay disable <relay>
+herdr machine relay remove <relay>
+```
+
+`relay add` saves the hub only after listing its dial-in machines over noninteractive SSH; the label defaults to the SSH host. `<relay>` is a relay's ID or label. The `--machine` prefix accepts a relay machine as `<relay>/<machine>`, by the ID `machine list` shows for it, or by a machine label that only one relay lists; `machine list` includes relay machines with `kind` `via`. `machine status`, `reconnect`, `update`, `agent-forwarding`, `rename`, `enable`, `disable`, `remove`, and `authorize` for a relay machine run on the hub over interactive SSH. Relay connections run `herdr link-connect` on the hub, an internal command that joins the SSH session to the machine's link and lends the session's forwarded SSH agent when the machine has agent forwarding on. See [Use the hub from a laptop](/docs/connecting-machines/#use-the-hub-from-a-laptop).
+
 ## Shell completions
 
 ```bash

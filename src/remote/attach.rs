@@ -295,6 +295,17 @@ impl RemotePlatform {
         Some(Self { os, arch })
     }
 
+    /// From Rust target names (`std::env::consts::OS` / `ARCH`), as a
+    /// dial-in machine reports them in its link hello.
+    fn from_target(os: &str, arch: &str) -> Option<Self> {
+        let uname = match os {
+            "linux" => "Linux",
+            "macos" => "Darwin",
+            _ => return None,
+        };
+        Self::from_uname(uname, arch)
+    }
+
     fn local() -> Self {
         let os = if cfg!(target_os = "linux") {
             "linux"
@@ -526,7 +537,7 @@ fn windows_powershell_streaming_application_script(path: &str, args: &[&str]) ->
     )
 }
 
-fn posix_remote_output_command(command: &str) -> String {
+pub(super) fn posix_remote_output_command(command: &str) -> String {
     format!("printf '\n%s\n' '{REMOTE_OUTPUT_READY_MARKER}'\n{command}")
 }
 
@@ -657,9 +668,11 @@ fn current_channel() -> &'static str {
     crate::build_info::channel()
 }
 
-struct InstallSource {
-    path: PathBuf,
+pub(crate) struct InstallSource {
+    pub(crate) path: PathBuf,
     temporary_dir: Option<PathBuf>,
+    /// The SHA-256 the release manifest published for a downloaded asset.
+    pub(crate) expected_sha256: Option<String>,
 }
 
 struct RemoteReleaseAsset {
@@ -866,7 +879,7 @@ impl RemoteSsh {
         normalize_remote_output(output)
     }
 
-    fn framed_user_shell_output(&self, remote_command: &str) -> io::Result<Output> {
+    pub(super) fn framed_user_shell_output(&self, remote_command: &str) -> io::Result<Output> {
         let mut command = self.command();
         command
             // Windows OpenSSH can still read the console with stdin redirected to NUL.
@@ -1266,6 +1279,7 @@ impl InstallSource {
         Self {
             path,
             temporary_dir: None,
+            expected_sha256: None,
         }
     }
 
@@ -1273,10 +1287,11 @@ impl InstallSource {
         Self {
             path,
             temporary_dir: Some(temporary_dir),
+            expected_sha256: None,
         }
     }
 
-    fn cleanup(&self) {
+    pub(crate) fn cleanup(&self) {
         if let Some(dir) = &self.temporary_dir {
             let _ = fs::remove_dir_all(dir);
         }
@@ -1890,6 +1905,81 @@ fn resolve_install_source(
     download_release_asset(platform)
 }
 
+/// The Herdr executable at this build's version for a dial-in machine whose
+/// link hello reported `os`/`arch`, and where it comes from:
+/// `HERDR_REMOTE_BINARY`, this executable on the same platform, or the
+/// release asset, which must come with a published SHA-256 (preview builds
+/// included). The release asset is the same Herdr as this build only when
+/// this build is that release, so a custom build needs `HERDR_REMOTE_BINARY`.
+pub(crate) fn resolve_dial_in_update_source(
+    os: &str,
+    arch: &str,
+) -> io::Result<(InstallSource, String)> {
+    let platform = RemotePlatform::from_target(os, arch).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("Herdr has no builds for {os}/{arch}"),
+        )
+    })?;
+    if let Some(path) = remote_binary_override_path()? {
+        let origin = format!("{REMOTE_BINARY_ENV_VAR} ({})", path.display());
+        return Ok((InstallSource::persistent(path), origin));
+    }
+    let exe = std::env::current_exe()?;
+    let package_managed = crate::update::is_package_manager_managed_exe_path(&exe);
+    if platform == RemotePlatform::local() && !package_managed {
+        let origin = format!("this hub's executable ({})", exe.display());
+        return Ok((InstallSource::persistent(exe), origin));
+    }
+    // Package managers install released versions; anything else must be
+    // the published release asset itself.
+    if !package_managed {
+        let published = remote_release_asset(&RemotePlatform::local().asset_key())
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot tell whether this hub runs the published herdr {} release: {error}; set {REMOTE_BINARY_ENV_VAR} to a herdr executable built for {}",
+                        current_version(),
+                        platform.asset_key()
+                    ),
+                )
+            })?
+            .sha256;
+        let own = crate::checksum::file_sha256(&exe)?;
+        if let Some(refusal) = custom_build_refusal(&own, published.as_deref(), &platform) {
+            return Err(io::Error::other(refusal));
+        }
+    }
+    let asset_key = platform.asset_key();
+    let asset = remote_release_asset(&asset_key)?;
+    if asset.sha256.is_none() {
+        return Err(io::Error::other(format!(
+            "the release manifest publishes no SHA-256 for the {asset_key} asset; set {REMOTE_BINARY_ENV_VAR} to a verified Herdr executable"
+        )));
+    }
+    let origin = format!("the published release asset {}", asset.url);
+    Ok((download_remote_asset(&asset_key, asset)?, origin))
+}
+
+/// Why the release asset for `platform` cannot stand in for this build:
+/// this executable (SHA-256 `own`) is not the published release for this
+/// hub's platform (`published`).
+fn custom_build_refusal(
+    own: &str,
+    published: Option<&str>,
+    platform: &RemotePlatform,
+) -> Option<String> {
+    if published.is_some_and(|published| published.trim().eq_ignore_ascii_case(own)) {
+        return None;
+    }
+    let version = current_version();
+    Some(format!(
+        "this hub runs a custom build of herdr {version}, not the published release, so the published {asset} asset may lack what this build has; set {REMOTE_BINARY_ENV_VAR} to a herdr {version} executable built for {asset}",
+        asset = platform.asset_key()
+    ))
+}
+
 fn local_binary_can_seed_remote(platform: &RemotePlatform) -> bool {
     if platform.is_windows() || *platform != RemotePlatform::local() {
         return false;
@@ -2436,8 +2526,11 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
     let asset_key = platform.asset_key();
     let asset = remote_release_asset(&asset_key)?;
+    download_remote_asset(&asset_key, asset)
+}
 
-    let dir = private_download_dir(&asset_key)?;
+fn download_remote_asset(asset_key: &str, asset: RemoteReleaseAsset) -> io::Result<InstallSource> {
+    let dir = private_download_dir(asset_key)?;
     let path = dir.join("herdr.tmp");
     let status = crate::noninteractive_process::curl_command()
         .args(["-sfL", "--max-time", "120", "-o"])
@@ -2459,7 +2552,10 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
         }
     }
 
-    Ok(InstallSource::temporary(path, dir))
+    Ok(InstallSource {
+        expected_sha256: asset.sha256,
+        ..InstallSource::temporary(path, dir)
+    })
 }
 
 fn fetch_remote_manifest(url: &str) -> io::Result<Vec<u8>> {
@@ -4417,6 +4513,11 @@ mod tests {
             "macos-aarch64"
         );
         assert!(RemotePlatform::from_uname("FreeBSD", "x86_64").is_none());
+        assert_eq!(
+            RemotePlatform::from_target("macos", "aarch64"),
+            RemotePlatform::from_uname("Darwin", "arm64")
+        );
+        assert!(RemotePlatform::from_target("windows", "x86_64").is_none());
     }
 
     #[test]
@@ -5502,6 +5603,26 @@ function Get-Process {
                 platform.asset_key()
             )
         );
+    }
+
+    #[test]
+    fn dial_in_updates_send_release_assets_only_from_published_builds() {
+        let mac = RemotePlatform::from_target("macos", "aarch64").unwrap();
+        let own = "ab".repeat(32);
+        assert_eq!(custom_build_refusal(&own, Some(&own), &mac), None);
+        assert_eq!(
+            custom_build_refusal(&own, Some(&format!(" {} ", own.to_uppercase())), &mac),
+            None
+        );
+        for published in [None, Some("cd".repeat(32))] {
+            let refusal = custom_build_refusal(&own, published.as_deref(), &mac).unwrap();
+            assert!(refusal.contains("custom build"), "{refusal}");
+            assert!(
+                refusal.contains("set HERDR_REMOTE_BINARY")
+                    && refusal.contains("built for macos-aarch64"),
+                "{refusal}"
+            );
+        }
     }
 
     #[test]

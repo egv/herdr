@@ -27,6 +27,7 @@ mod api;
 mod completion;
 mod integration;
 mod machine;
+mod machine_dial;
 mod notification;
 mod pane;
 mod plugin;

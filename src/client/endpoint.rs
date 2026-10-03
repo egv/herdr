@@ -6,9 +6,11 @@ use sha2::{Digest as _, Sha256};
 mod activation;
 mod catalog;
 mod control;
+mod dial_in_catalog;
 mod health;
 mod message_policy;
 mod registry;
+mod relay_catalog;
 mod ssh_metadata;
 mod supervisor;
 mod writer;
@@ -16,8 +18,15 @@ mod writer;
 pub(crate) use activation::*;
 pub(crate) use catalog::*;
 pub(crate) use control::*;
+pub(crate) use dial_in_catalog::{dial_in_catalog_path, DialInCatalog, DialInMachine};
 pub(crate) use message_policy::*;
 pub(crate) use registry::*;
+#[cfg(test)]
+pub(crate) use relay_catalog::via_id;
+pub(crate) use relay_catalog::{
+    validate_relay_target, ListedVia, RelayCatalog, RelayHub, RelayListedMachine, RelayListing,
+    ViaMachine, RELAY_LISTING_VERSION,
+};
 pub(crate) use ssh_metadata::{SshMachineMetadata, SshMetadataCache};
 pub(crate) use supervisor::*;
 pub(crate) use writer::NativeEndpointTransport;
@@ -73,6 +82,8 @@ impl fmt::Display for ProfileId {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ClientEndpointId {
     Local,
+    /// A saved machine profile; its transport (SSH or dial-in) comes from the
+    /// catalog it was loaded from. Profile ids are unique across catalogs.
     Ssh(ProfileId),
 }
 

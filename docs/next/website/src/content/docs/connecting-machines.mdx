@@ -27,6 +27,8 @@ ssh workbox
 
 Multi-machine connections support Linux, macOS, and Windows clients connecting to Linux or macOS servers on x86_64 or aarch64, or Windows servers on x86_64. Interactive setup can install or update the complete remote package after confirmation; background reconnects only discover installed packages. See [Remote attach over SSH](/docs/persistence-remote/#remote-attach-over-ssh) for SSH configuration, authentication, and custom binaries.
 
+If the machine cannot accept SSH connections but can reach your computer over SSH, see [Machines that dial in](#machines-that-dial-in).
+
 ## Add a machine
 
 Run setup in an interactive terminal so Herdr can ask before installing or replacing anything:
@@ -126,3 +128,125 @@ The client and server negotiate compatibility rather than requiring identical ve
 Updating a compatible client does not replace the running remote server or stop its agents. When you need new server-side behavior, update that server explicitly. Normal replacement asks before stopping the server and its pane processes.
 
 Live handoff is experimental and opt-in. For a supported server that needs replacement during standalone setup, you can explicitly add `--handoff` to `herdr --remote`; it is not needed for normal connections or authentication fixes. See [Update](/docs/install/#update) for restart and handoff choices, and [Session state and restore](/docs/session-state/) for what survives each operation.
+
+## Machines that dial in
+
+Use a dial-in machine when your Herdr client, the hub, cannot reach a machine over SSH: the machine runs no SSH server or has no public address, but it can make outbound SSH connections to the hub. The machine keeps one OpenSSH connection open to the hub, logged in as your hub user. The hub's sidebar, agent list, and `--machine` commands use that connection; the hub never connects to the machine.
+
+The hub and the machine both run Linux or macOS with Herdr installed. The hub needs an SSH server the machine can reach, and the machine needs the OpenSSH client. A dial-in machine shows one Herdr session, `default` unless you choose another with `--remote-session`.
+
+### Pair a machine
+
+On the machine, pair through your own SSH login to the hub:
+
+```bash
+herdr machine dial setup workbox --hub you@hub --pair
+```
+
+Setup generates an ed25519 key without a passphrase for this link in `~/.local/state/herdr/dial/workbox/`. It then runs `herdr machine add --dial-in` on the hub with ordinary interactive `ssh`, so password and host-key prompts work. The hub saves the machine and authorizes the key in its `~/.ssh/authorized_keys`. This login also records the hub's host key, which the link requires. Add `--label` to set the hub label (default: the link name), `--remote-session <name>` to show another session, `--agent-forwarding` to turn on [agent forwarding](#agent-forwarding), or `--identity <path>` to use an existing key that needs no passphrase. If `herdr` is not on the hub's `PATH` for non-interactive SSH commands, pass `--hub-herdr '~/.local/bin/herdr'`.
+
+To pair without logging in to the hub from the machine, start on the hub:
+
+```bash
+herdr machine add --dial-in --label workbox --hub you@hub
+```
+
+`--hub` is the SSH target the machine uses to reach the hub; it only fills in the printed `herdr machine dial setup workbox --hub you@hub --link <id>` command. Run that command on the machine. It prints a `herdr machine authorize <id> '<public key>' --write` command; run that on the hub. Without `--write`, `authorize` prints the line for you to add yourself; `--authorized-keys <path>` edits a different file. Then run `ssh you@hub true` on the machine once, so it trusts the hub's host key.
+
+Herdr edits only the `authorized_keys` lines it wrote. It refuses a key that is already authorized, replaces the machine's existing line only with `--replace`, and leaves every other line unchanged. The line runs the hub's `herdr` executable, or a stable launcher when that executable lives in a versioned package directory such as Homebrew's or Nix's; pass `--herdr-path` to choose another.
+
+### Keep the link running
+
+Run `herdr machine dial run workbox` to keep the link open in the foreground until Ctrl-C. To keep it running across logins and reboots, install a user service instead:
+
+```bash
+herdr machine dial service install workbox
+herdr machine dial service status workbox
+herdr machine dial service uninstall workbox
+```
+
+On Linux, `install` enables and starts the systemd user unit `herdr-dial@workbox.service`. User services stop when you log out unless lingering is enabled; on a headless machine, run `loginctl enable-linger $USER` once. Read logs with `journalctl --user -u herdr-dial@workbox.service`. On macOS, `install` loads the launchd agent `dev.herdr.dial.workbox` in your desktop login session and logs to `service.log` in the link directory; on a Mac nobody logs in to, keep `herdr machine dial run workbox` running under another supervisor instead. `--no-start` installs without starting the link now. If enabling or starting the service fails, `install` removes the unit it wrote; on macOS, a reinstall puts back the agent it replaced and starts it again. Like `authorize`, the service prefers a stable launcher over a versioned package path; `--herdr-path` chooses the executable it runs.
+
+The service keeps `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, and `PATH` from the shell that runs `install`. The Herdr server the link starts passes them on to its panes, and ssh uses that `PATH` for programs your SSH config runs, such as a `ProxyCommand`. Run `install` from a normal login shell, and again after changing them.
+
+On macOS, the server the service starts, and every pane in it, runs under the privacy permissions of the Herdr executable the service runs, not those of Terminal. Folders such as Desktop, Documents, Downloads, iCloud Drive, and network or removable volumes then ask for permission on a Mac nobody may be looking at, or refuse access. Grant that executable (`install` prints its path) Full Disk Access, or access to the folders you need, in System Settings > Privacy & Security, or keep projects outside those folders. Release builds are not signed with a developer identity, so macOS may forget the grant when Herdr is updated; grant it again after updates.
+
+The link reconnects on its own, waiting from one second up to a minute between attempts. After authentication failures, unverified host keys, or links the hub refuses, it waits five minutes; restart the dialer or the service after fixing the cause to retry immediately. When the link comes up, the machine starts its Herdr server for the session if needed. Stopping the dialer or the service closes the link but leaves that server and its panes running. When Herdr on the machine is replaced, for example by `herdr update`, the running link restarts into the new executable within 30 seconds.
+
+### Using a dial-in machine
+
+Open hub windows show the machine as soon as it is saved and connect within a few seconds after it dials in. It then behaves like a saved SSH machine: switching, agent navigation, notifications, and reconnect states work as described above. Several hub windows can use it at once. Each window and each `--machine` command opens its own SSH session over the machine's connection, and the machine opens additional connections when the hub's `MaxSessions` limit is reached.
+
+`herdr --machine <label-or-id> ...` supports the same commands as for SSH machines and needs no open hub window. `herdr machine list`, `status`, `rename`, `enable`, `disable`, and `remove` work for dial-in machines too. Disabling or removing a dial-in machine closes its link within a few seconds and leaves its sessions running.
+
+### Agent forwarding
+
+Agent forwarding is off by default. Turn it on for one machine on the hub, or add `--agent-forwarding` to `machine add --dial-in` or `machine dial setup --pair`:
+
+```bash
+herdr machine agent-forwarding workbox on
+```
+
+Hub windows started with `SSH_AUTH_SOCK` lend that agent to the machine while they are connected to it. If several windows lend one, the most recently connected window's agent is used. A window that was already connected starts lending the next time it connects to the machine. `--machine` commands never lend an agent. Without a lending window, agent requests on the machine fail, and an agent connection already open on the machine ends at its next request once its window stops lending, forwarding is turned off, or the link goes down.
+
+Only listing keys and signing reach your agent; requests to add, remove, or lock keys, and agent extensions, are refused on the hub. The machine's panes receive the agent as described for [SSH machines](#connection-problems), including the need to recreate panes started before the session first had an agent. `herdr machine status` shows how many hub windows are lending an agent, and `agent-forwarding on` warns when the machine's Herdr is too old to forward one. SSH machines keep using `ForwardAgent yes` in your SSH config instead.
+
+### Update a dial-in machine
+
+Herdr does not install or update dial-in machines when they connect. To install this hub's Herdr version on a connected machine, run:
+
+```bash
+herdr machine update workbox
+herdr machine update workbox --restart-server
+```
+
+The hub sends `HERDR_REMOTE_BINARY` when set, this executable when the platforms match, or otherwise the release asset for the machine's platform, which must have a published SHA-256; the confirmation names what it sends. The release asset is used only when the hub runs that published release or a package manager's build of it: a hub built from source must set `HERDR_REMOTE_BINARY` to a build of the same version for the machine's platform, for example `HERDR_REMOTE_BINARY=~/herdr-macos-aarch64 herdr machine update workbox`. The machine verifies the checksum, checks that the new executable runs `--version` and can read this link with `herdr machine dial status`, keeps the previous executable as `<path>.prev`, replaces it, and restarts its link. `machine update` waits up to a minute for the machine to reconnect with the new version. If the new version cannot connect within five minutes, the machine restores the previous executable, also when the new version exits and the dialer or its service starts it again. If Herdr on the machine is replaced again meanwhile, for example by `herdr update`, that version stays. A new version whose dialer cannot start at all cannot restore anything; then move `<path>.prev` back over `<path>` on the machine.
+
+`machine update` asks for confirmation with a default answer of No; `--yes` accepts every prompt and is required without an interactive terminal. The machine refuses the update when a package manager such as Homebrew, mise, or Nix owns its Herdr executable, or when it cannot write to the executable's directory; update those installations on the machine itself. A machine whose Herdr predates hub updates must also be updated there once. If Herdr on the hub was upgraded while the link stayed up, `machine update` and `agent-forwarding on` ask you to make the link reconnect first.
+
+The machine's running server keeps the previous version and its panes. `--restart-server` restarts it after a successful update, which stops every pane and agent in that session, so it asks again before restarting. Alternatively, run `herdr server stop` on the machine later; the next hub window connection starts the server again.
+
+### Status and troubleshooting
+
+On the hub, `herdr machine status <label-or-id>` reports `connected`, `offline`, or `server unavailable`, with the machine's Herdr version, platform, and last link and stream errors. When the machine reconnects after a failure, it also reports that failure as `slave reported: ...`. `herdr machine reconnect <label-or-id>` cannot start the connection; it waits up to 30 seconds (`--wait <seconds>`) and exits 0 once the machine is connected. In the sidebar, dial-in machines never show `! auth`. Clicking a waiting machine's status shows the latest error and suggests a command to run on that machine.
+
+On the machine, `herdr machine dial status` shows the hub, link ID, state (`connecting`, `connected`, `backoff`, or `stopped`), the next attempt, and the last error. Without a name, it uses the only link. `herdr machine dial list` shows every link. The link also logs to `dial-<name>.log` next to Herdr's other [logs](/docs/configuration/#logs).
+
+- **`host_key_unverified`:** run `ssh <hub> true` on the machine once and accept the hub's host key.
+- **`authentication_failed`:** the hub does not accept the machine's key. On the hub, run the `herdr machine authorize ... --write` command that setup printed.
+- **`link_unknown` or `link_disabled`:** the hub removed or disabled the machine.
+- **`link claimed by more than one machine`:** `machine status` shows this warning when two machines use the same key and link, so that they take it from each other or the connected one keeps refusing the other, for example after a link directory was copied. Revoke the key and pair each machine separately.
+
+`herdr machine dial remove <name>` deletes a link's configuration and generated key. It refuses while the link is running or its service is installed; uninstall the service first.
+
+### Use the hub from a laptop
+
+When the hub is a server you reach over SSH, a Herdr client on another computer, such as a laptop, can use the hub's dial-in machines through it. On the laptop, save the hub as a relay:
+
+```bash
+herdr machine relay add you@hub --label vps
+herdr machine relay list
+herdr machine relay remove vps
+```
+
+`relay add` checks over SSH that the hub's Herdr supports dial-in machines, then lists them; if the check fails, nothing is saved. The laptop needs the same SSH access to the hub, without password prompts, as for a [saved SSH machine](#before-you-connect). The label defaults to the SSH host. `relay rename <relay> --label <label>`, `enable`, and `disable` change only the laptop's settings; removing or disabling a relay leaves its machines connected to the hub.
+
+The hub's dial-in machines appear in the laptop's sidebar as `<relay>/<machine>`, such as `vps/workbox`, and `herdr --machine vps/workbox pane list` works as for a saved machine. A machine label that only one relay lists works alone too. `herdr machine list` includes them with `kind` `via`, and an unreachable relay is only a warning. Open laptop windows check each relay's machines every 15 seconds. Each window and each `--machine` command opens its own SSH session to the hub, where `herdr link-connect` joins it to the machine's link.
+
+`herdr machine status`, `reconnect`, `update`, `agent-forwarding`, `rename`, `enable`, `disable`, `remove`, and `authorize` for a relay machine run on the hub over your interactive SSH, with the hub's ID for the machine:
+
+```bash
+herdr machine status vps/workbox
+herdr machine update vps/workbox
+```
+
+To lend your laptop's SSH agent to a relay machine, set `ForwardAgent yes` for the hub in your SSH config and turn on agent forwarding for the machine with `herdr machine agent-forwarding vps/workbox on`. Laptop windows connected to the machine then lend the agent that SSH forwards to the hub, like hub windows do.
+
+### Security model
+
+- **The machine's key opens only its own link.** Its `authorized_keys` line ends in `herdr-link:<id>` and uses `restrict` with a forced `herdr link-accept` command for that one machine. sshd runs that command whatever the machine requests, and the key cannot open a shell, a terminal, or port forwarding on the hub. `herdr machine remove <id> --revoke` deletes the line; without `--revoke`, delete it yourself. `herdr machine disable` closes the link and keeps the key.
+- **Hub sockets are private to your user.** Each machine's sockets live in a mode 0700 directory under Herdr's state directory, and the hub accepts connections only from processes running as your user.
+- **The hub fully controls the machine.** Through its link, the hub can open panes and run commands as the machine's user, read terminal output, install executables with `machine update`, and restart the machine's server. Pair a machine only with a hub you trust as much as that machine's account.
+- **Local processes share that authority.** Any process running as your user on the hub, including agents in Herdr panes, can control a connected dial-in machine with `herdr --machine`. On the machine, while agent forwarding is on and a hub window lends its agent, any process running as the machine's user can list your keys and request signatures, as with OpenSSH `ForwardAgent`.
+
+The machine verifies the hub's host key strictly and never answers SSH prompts. The hub's dial-in catalog stores each machine's ID, label, session, enabled state, and forwarding setting, not keys or passwords. Text the machine reports, such as versions and errors, is sanitized before the hub displays it.

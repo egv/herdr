@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use super::ProfileId;
+use super::{dial_in_catalog_path, DialInCatalog, DialInMachine, ProfileId, ViaMachine};
 
 const CATALOG_VERSION: u32 = 1;
 const SELECTION_VERSION: u32 = 1;
@@ -71,14 +71,129 @@ impl SavedSshEndpoint {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// How a saved machine is reached. Saved machines share one id space
+/// ([`ProfileId`]) across catalogs, so the kind is a property of the catalog
+/// the machine was loaded from, not of its identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SavedMachineKind {
+    /// Reached by this client over SSH (`endpoints.json`).
+    Ssh,
+    /// Reaches this hub by dialing in (`dial-in-machines.json`).
+    DialIn,
+    /// A dial-in machine of a relay hub, reached through that hub.
+    Via,
+}
+
+/// Catalog-neutral facts about one saved machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SavedMachineSummary {
+    pub(crate) id: ProfileId,
+    pub(crate) label: String,
+    pub(crate) enabled: bool,
+    pub(crate) kind: SavedMachineKind,
+}
+
+impl From<&SavedSshEndpoint> for SavedMachineSummary {
+    fn from(profile: &SavedSshEndpoint) -> Self {
+        Self {
+            id: profile.id.clone(),
+            label: profile.label.clone(),
+            enabled: profile.enabled,
+            kind: SavedMachineKind::Ssh,
+        }
+    }
+}
+
+impl From<&DialInMachine> for SavedMachineSummary {
+    fn from(machine: &DialInMachine) -> Self {
+        Self {
+            id: machine.id.clone(),
+            label: machine.label.clone(),
+            enabled: machine.enabled,
+            kind: SavedMachineKind::DialIn,
+        }
+    }
+}
+
+impl From<&ViaMachine> for SavedMachineSummary {
+    fn from(machine: &ViaMachine) -> Self {
+        Self {
+            id: machine.id.clone(),
+            label: machine.display_label(),
+            enabled: true,
+            kind: SavedMachineKind::Via,
+        }
+    }
+}
+
+/// SSH machines first, then dial-in machines, each in catalog order.
+pub(crate) fn saved_machine_summaries(
+    ssh: &[SavedSshEndpoint],
+    dial_in: &[DialInMachine],
+) -> Vec<SavedMachineSummary> {
+    ssh.iter()
+        .map(SavedMachineSummary::from)
+        .chain(dial_in.iter().map(SavedMachineSummary::from))
+        .collect()
+}
+
+/// Drops dial-in machines whose id is also a saved SSH profile id. Ids are
+/// generated unique across both catalogs, so a collision means a hand-edited
+/// file; the SSH profile keeps the identity.
+pub(crate) fn dial_in_without_id_collisions(
+    ssh: &[SavedSshEndpoint],
+    dial_in: Vec<DialInMachine>,
+) -> Vec<DialInMachine> {
+    dial_in
+        .into_iter()
+        .filter(|machine| {
+            let collides = ssh.iter().any(|profile| profile.id == machine.id);
+            if collides {
+                tracing::warn!(
+                    id = %machine.id,
+                    "ignoring dial-in machine whose id is also a saved SSH machine"
+                );
+            }
+            !collides
+        })
+        .collect()
+}
+
+/// Saved machines and this client's selection.
+///
+/// `endpoints.json` stays byte-compatible strict v1 (`deny_unknown_fields`) so
+/// older Herdr binaries keep every SSH machine. Dial-in machines live here only
+/// in memory and are persisted by [`DialInCatalog`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EndpointCatalog {
     version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// In memory and in the selection file this may name an enabled SSH or
+    /// dial-in machine; `endpoints.json` only ever records an SSH selection.
+    #[serde(default)]
     pub(crate) selected_profile: Option<ProfileId>,
     #[serde(default)]
     pub(crate) ssh: Vec<SavedSshEndpoint>,
+    #[serde(skip)]
+    pub(crate) dial_in: Vec<DialInMachine>,
+    /// Machines reached through relay hubs, as last listed by them.
+    #[serde(skip)]
+    pub(crate) via: Vec<ViaMachine>,
+    /// Whether an enabled relay hub is saved, which makes this client federated.
+    #[serde(skip)]
+    pub(crate) relays_enabled: bool,
+    /// A stored selection naming no known machine yet: a relay may list it.
+    #[serde(skip)]
+    pub(crate) pending_selection: Option<ProfileId>,
+}
+
+/// The exact v1 `endpoints.json` shape.
+#[derive(Serialize)]
+struct StoredEndpointCatalog<'a> {
+    version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_profile: Option<&'a ProfileId>,
+    ssh: &'a [SavedSshEndpoint],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -94,13 +209,38 @@ impl Default for EndpointCatalog {
             version: CATALOG_VERSION,
             selected_profile: None,
             ssh: Vec::new(),
+            dial_in: Vec::new(),
+            via: Vec::new(),
+            relays_enabled: false,
+            pending_selection: None,
         }
     }
 }
 
 impl EndpointCatalog {
+    /// Loads saved SSH machines, dial-in machines and this client's selection.
+    /// An unusable dial-in catalog never prevents loading SSH machines.
     pub(crate) fn load() -> Result<Self, String> {
-        Self::load_from_paths(&catalog_path(), &selection_path())
+        let mut catalog =
+            Self::load_from_paths(&catalog_path(), &dial_in_catalog_path(), &selection_path())?;
+        catalog.set_relays_enabled(
+            super::RelayCatalog::load()
+                .inspect_err(|error| tracing::warn!(%error, "saved relay hubs are unavailable"))
+                .is_ok_and(|relays| relays.enabled().next().is_some()),
+        );
+        Ok(catalog)
+    }
+
+    /// With an enabled relay hub, a selection naming no known machine yet
+    /// may be a via machine that a relay lists later: it waits, and wins
+    /// over the SSH selection that `endpoints.json` keeps for older Herdr.
+    fn set_relays_enabled(&mut self, enabled: bool) {
+        self.relays_enabled = enabled;
+        if !enabled {
+            self.pending_selection = None;
+        } else if self.pending_selection.is_some() {
+            self.selected_profile = None;
+        }
     }
 
     pub(crate) fn load_profiles() -> Result<Vec<SavedSshEndpoint>, String> {
@@ -108,19 +248,37 @@ impl EndpointCatalog {
         Self::load_from_path(&catalog_path()).map(|catalog| catalog.ssh)
     }
 
-    fn load_from_paths(catalog_path: &Path, selection_path: &Path) -> Result<Self, String> {
+    pub(crate) fn load_dial_in_machines() -> Result<Vec<DialInMachine>, String> {
+        DialInCatalog::load().map(|catalog| catalog.machines)
+    }
+
+    fn load_from_paths(
+        catalog_path: &Path,
+        dial_in_path: &Path,
+        selection_path: &Path,
+    ) -> Result<Self, String> {
         let mut catalog = Self::load_from_path(catalog_path)?;
+        let dial_in = DialInCatalog::load_from_path(dial_in_path)
+            .map(|dial_in| dial_in.machines)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    %error,
+                    path = %dial_in_path.display(),
+                    "saved dial-in machines are unavailable; keeping SSH machines"
+                );
+                Vec::new()
+            });
+        catalog.dial_in = dial_in_without_id_collisions(&catalog.ssh, dial_in);
         match load_selection_from_path(selection_path) {
             Ok(Some(selection)) => {
-                let valid = selection.selected_profile.as_ref().is_none_or(|selected| {
-                    catalog
-                        .ssh
-                        .iter()
-                        .any(|profile| &profile.id == selected && profile.enabled)
-                });
+                let valid = selection
+                    .selected_profile
+                    .as_ref()
+                    .is_none_or(|selected| catalog.machine_is_enabled(selected));
                 if valid {
                     catalog.selected_profile = selection.selected_profile;
                 } else {
+                    catalog.pending_selection = selection.selected_profile;
                     tracing::warn!(
                         path = %selection_path.display(),
                         "saved endpoint selection is absent or disabled; using Local"
@@ -198,6 +356,7 @@ impl EndpointCatalog {
 
     pub(crate) fn select_local(&mut self) {
         self.selected_profile = None;
+        self.pending_selection = None;
     }
 
     pub(crate) fn select_endpoint(&mut self, endpoint_id: &super::ClientEndpointId) -> bool {
@@ -210,20 +369,51 @@ impl EndpointCatalog {
         }
     }
 
+    /// Selects an enabled saved machine (SSH or dial-in) by id.
     pub(crate) fn select_ssh(&mut self, id: &ProfileId) -> bool {
-        if !self
-            .ssh
-            .iter()
-            .any(|profile| &profile.id == id && profile.enabled)
-        {
+        if !self.machine_is_enabled(id) {
             return false;
         }
         self.selected_profile = Some(id.clone());
+        self.pending_selection = None;
         true
+    }
+
+    /// Whether `id` names an enabled saved machine in either catalog, or a
+    /// machine a relay hub lists.
+    pub(crate) fn machine_is_enabled(&self, id: &ProfileId) -> bool {
+        self.ssh_is_enabled(id)
+            || self
+                .dial_in
+                .iter()
+                .any(|machine| &machine.id == id && machine.enabled)
+            || self.via.iter().any(|machine| &machine.id == id)
+    }
+
+    fn ssh_is_enabled(&self, id: &ProfileId) -> bool {
+        self.ssh
+            .iter()
+            .any(|profile| &profile.id == id && profile.enabled)
     }
 
     pub(crate) fn has_enabled_ssh(&self) -> bool {
         self.ssh.iter().any(|profile| profile.enabled)
+    }
+
+    /// Whether any saved machine (SSH or dial-in) is enabled, which makes
+    /// this client federated.
+    pub(crate) fn has_enabled_machines(&self) -> bool {
+        self.has_enabled_ssh()
+            || self.dial_in.iter().any(|machine| machine.enabled)
+            || self.relays_enabled
+            || !self.via.is_empty()
+    }
+
+    /// SSH, dial-in, then via machines.
+    pub(crate) fn machine_summaries(&self) -> Vec<SavedMachineSummary> {
+        let mut summaries = saved_machine_summaries(&self.ssh, &self.dial_in);
+        summaries.extend(self.via.iter().map(SavedMachineSummary::from));
+        summaries
     }
 
     pub(crate) fn contains_enabled_target_session(&self, target: &str, session: &str) -> bool {
@@ -243,7 +433,35 @@ impl EndpointCatalog {
         true
     }
 
+    /// Validates the in-memory catalog: the selection may name an enabled SSH
+    /// or dial-in machine.
     fn validate(&self) -> Result<(), String> {
+        self.validate_profiles()?;
+        if self
+            .selected_profile
+            .as_ref()
+            .is_some_and(|selected| !self.machine_is_enabled(selected))
+        {
+            return Err("selected machine is absent or disabled in the catalog".into());
+        }
+        Ok(())
+    }
+
+    /// The strict v1 rules for `endpoints.json`, unchanged so files written by
+    /// this version load in older binaries and vice versa.
+    fn validate_stored(&self) -> Result<(), String> {
+        self.validate_profiles()?;
+        if self
+            .selected_profile
+            .as_ref()
+            .is_some_and(|selected| !self.ssh_is_enabled(selected))
+        {
+            return Err("selected SSH endpoint is absent or disabled in the catalog".into());
+        }
+        Ok(())
+    }
+
+    fn validate_profiles(&self) -> Result<(), String> {
         if self.version != CATALOG_VERSION {
             return Err(format!(
                 "unsupported endpoint catalog version {}; expected {CATALOG_VERSION}",
@@ -261,14 +479,6 @@ impl EndpointCatalog {
             if !ids.insert(profile.id.clone()) {
                 return Err(format!("duplicate endpoint profile id {}", profile.id));
             }
-        }
-        if self.selected_profile.as_ref().is_some_and(|selected| {
-            !self
-                .ssh
-                .iter()
-                .any(|profile| &profile.id == selected && profile.enabled)
-        }) {
-            return Err("selected SSH endpoint is absent or disabled in the catalog".into());
         }
         Ok(())
     }
@@ -299,13 +509,23 @@ impl EndpointCatalog {
         }
         let catalog: Self = serde_json::from_str(&content)
             .map_err(|error| format!("stored endpoint catalog is invalid: {error}"))?;
-        catalog.validate()?;
+        catalog.validate_stored()?;
         Ok(catalog)
     }
 
     fn store_to_path(&self, path: &Path) -> Result<(), String> {
         self.validate()?;
-        let content = serde_json::to_vec_pretty(self)
+        // Older binaries reject `endpoints.json` wholesale when its selection is
+        // not an enabled SSH profile, so a dial-in selection must never leak here.
+        let stored = StoredEndpointCatalog {
+            version: self.version,
+            selected_profile: self
+                .selected_profile
+                .as_ref()
+                .filter(|selected| self.ssh_is_enabled(selected)),
+            ssh: &self.ssh,
+        };
+        let content = serde_json::to_vec_pretty(&stored)
             .map_err(|error| format!("failed to encode endpoint catalog: {error}"))?;
         store_private_json(path, &content, "endpoint catalog")
     }
@@ -393,6 +613,271 @@ mod tests {
                 std::process::id()
             ))
             .join("endpoints.json")
+    }
+
+    /// A dial-in catalog path next to `catalog_path` that tests never create.
+    fn no_dial_in(catalog_path: &Path) -> PathBuf {
+        catalog_path.with_file_name("absent-dial-in-machines.json")
+    }
+
+    /// The `endpoints.json` loader of Herdr releases without dial-in support,
+    /// reproduced verbatim: strict fields and an SSH-only selection rule. Any
+    /// failure here means an older binary would drop every saved SSH machine.
+    fn load_strict_v1(path: &Path) -> Result<Vec<SavedSshEndpoint>, String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1Catalog {
+            version: u32,
+            #[serde(default)]
+            selected_profile: Option<ProfileId>,
+            #[serde(default)]
+            ssh: Vec<SavedSshEndpoint>,
+        }
+        let catalog: V1Catalog =
+            serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        if catalog.version != 1 {
+            return Err("version".into());
+        }
+        let mut ids = HashSet::new();
+        for profile in &catalog.ssh {
+            profile.validate()?;
+            if !ids.insert(profile.id.clone()) {
+                return Err("duplicate id".into());
+            }
+        }
+        if catalog.selected_profile.as_ref().is_some_and(|selected| {
+            !catalog
+                .ssh
+                .iter()
+                .any(|profile| &profile.id == selected && profile.enabled)
+        }) {
+            return Err("selected SSH endpoint is absent or disabled in the catalog".into());
+        }
+        Ok(catalog.ssh)
+    }
+
+    #[test]
+    fn dial_in_selection_never_leaks_into_strict_v1_endpoints_json() {
+        let catalog_path = path("dial-in-selection-leak");
+        let dial_in_path = catalog_path.with_file_name("dial-in-machines.json");
+        let selection_path = catalog_path.with_file_name("selection.json");
+        let _ = std::fs::remove_dir_all(catalog_path.parent().unwrap());
+
+        let mut catalog = EndpointCatalog::default();
+        let keep = catalog.add_ssh("Keep", "keep", "default").unwrap();
+        let toggled = catalog.add_ssh("Toggle", "toggle", "agents").unwrap();
+        catalog.store_to_path(&catalog_path).unwrap();
+        let mut dial_in = DialInCatalog::default();
+        let laptop = dial_in
+            .add("Laptop", "default", &[keep.clone(), toggled.clone()])
+            .unwrap();
+        dial_in.store_to_path(&dial_in_path).unwrap();
+
+        let mut catalog =
+            EndpointCatalog::load_from_paths(&catalog_path, &dial_in_path, &selection_path)
+                .unwrap();
+        assert_eq!(catalog.dial_in.len(), 1);
+        assert!(catalog.has_enabled_machines());
+        assert!(catalog.select_endpoint(&super::super::ClientEndpointId::Ssh(laptop.clone())));
+        catalog.store_selection_to_path(&selection_path).unwrap();
+        let mut catalog =
+            EndpointCatalog::load_from_paths(&catalog_path, &dial_in_path, &selection_path)
+                .unwrap();
+        assert_eq!(catalog.selected_profile.as_ref(), Some(&laptop));
+
+        let assert_v1 = |expected: &[(&ProfileId, &str, bool)]| {
+            let profiles = load_strict_v1(&catalog_path).unwrap();
+            let actual = profiles
+                .iter()
+                .map(|profile| (&profile.id, profile.label.as_str(), profile.enabled))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            let current = EndpointCatalog::load_from_path(&catalog_path).unwrap();
+            assert_eq!(current.selected_profile, None);
+            assert!(!std::fs::read_to_string(&catalog_path)
+                .unwrap()
+                .contains(laptop.as_str()));
+        };
+
+        let added = catalog.add_ssh("Added", "added", "default").unwrap();
+        catalog.store_to_path(&catalog_path).unwrap();
+        assert_v1(&[
+            (&keep, "Keep", true),
+            (&toggled, "Toggle", true),
+            (&added, "Added", true),
+        ]);
+        assert!(catalog.rename_ssh(&keep, "Kept").unwrap());
+        catalog.store_to_path(&catalog_path).unwrap();
+        assert_v1(&[
+            (&keep, "Kept", true),
+            (&toggled, "Toggle", true),
+            (&added, "Added", true),
+        ]);
+        assert!(catalog.set_enabled(&toggled, false));
+        catalog.store_to_path(&catalog_path).unwrap();
+        assert_v1(&[
+            (&keep, "Kept", true),
+            (&toggled, "Toggle", false),
+            (&added, "Added", true),
+        ]);
+        assert!(catalog.set_enabled(&toggled, true));
+        catalog.store_to_path(&catalog_path).unwrap();
+        assert!(catalog.remove_ssh(&added));
+        catalog.store_to_path(&catalog_path).unwrap();
+        assert_v1(&[(&keep, "Kept", true), (&toggled, "Toggle", true)]);
+        assert_eq!(catalog.selected_profile.as_ref(), Some(&laptop));
+
+        // An SSH selection is still recorded exactly as before.
+        assert!(catalog.select_ssh(&keep));
+        catalog.store_to_path(&catalog_path).unwrap();
+        assert!(load_strict_v1(&catalog_path).is_ok());
+        assert_eq!(
+            EndpointCatalog::load_from_path(&catalog_path)
+                .unwrap()
+                .selected_profile,
+            Some(keep.clone())
+        );
+        std::fs::remove_dir_all(catalog_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn via_selection_never_leaks_into_strict_v1_endpoints_json_and_survives_restarts() {
+        let catalog_path = path("via-selection-leak");
+        let selection_path = catalog_path.with_file_name("selection.json");
+        let _ = std::fs::remove_dir_all(catalog_path.parent().unwrap());
+        let mut catalog = EndpointCatalog::default();
+        let keep = catalog.add_ssh("Keep", "keep", "default").unwrap();
+        let relay = ProfileId::generate();
+        let link = ProfileId::generate();
+        let via = ViaMachine {
+            id: super::super::via_id(&relay, &link),
+            relay_id: relay,
+            relay_label: "vps".into(),
+            relay_target: "me@vps".into(),
+            link_id: link,
+            label: "slave1".into(),
+            session: "default".into(),
+            connected: true,
+        };
+        catalog.set_via(vec![via.clone()]);
+        assert!(catalog.has_enabled_machines());
+        assert_eq!(
+            catalog.machine_summaries().last().unwrap(),
+            &SavedMachineSummary {
+                id: via.id.clone(),
+                label: "vps/slave1".into(),
+                enabled: true,
+                kind: SavedMachineKind::Via,
+            }
+        );
+        assert!(catalog.select_endpoint(&super::super::ClientEndpointId::Ssh(via.id.clone())));
+        catalog.store_selection_to_path(&selection_path).unwrap();
+        assert!(catalog.rename_ssh(&keep, "Kept").unwrap());
+        catalog.store_to_path(&catalog_path).unwrap();
+        assert_eq!(load_strict_v1(&catalog_path).unwrap().len(), 1);
+        assert!(!std::fs::read_to_string(&catalog_path)
+            .unwrap()
+            .contains(via.id.as_str()));
+
+        // Relays list their machines only after startup: the selection waits.
+        let no_dial_in = no_dial_in(&catalog_path);
+        let mut restarted =
+            EndpointCatalog::load_from_paths(&catalog_path, &no_dial_in, &selection_path).unwrap();
+        assert_eq!(restarted.selected_profile, None);
+        restarted.set_via(Vec::new());
+        assert_eq!(restarted.selected_profile, None);
+        restarted.set_via(vec![via.clone()]);
+        assert_eq!(restarted.selected_profile.as_ref(), Some(&via.id));
+        // Choosing Local first drops the pending selection.
+        let mut restarted =
+            EndpointCatalog::load_from_paths(&catalog_path, &no_dial_in, &selection_path).unwrap();
+        restarted.select_local();
+        restarted.set_via(vec![via.clone()]);
+        assert_eq!(restarted.selected_profile, None);
+
+        // endpoints.json still names an older SSH selection (a catalog
+        // command stored it): the via selection wins once relays list it.
+        let mut catalog =
+            EndpointCatalog::load_from_paths(&catalog_path, &no_dial_in, &selection_path).unwrap();
+        catalog.selected_profile = Some(keep.clone());
+        catalog.store_to_path(&catalog_path).unwrap();
+        let mut restarted =
+            EndpointCatalog::load_from_paths(&catalog_path, &no_dial_in, &selection_path).unwrap();
+        assert_eq!(restarted.selected_profile.as_ref(), Some(&keep));
+        assert_eq!(restarted.pending_selection.as_ref(), Some(&via.id));
+        restarted.set_relays_enabled(true);
+        assert_eq!(restarted.selected_profile, None);
+        restarted.set_via(vec![via.clone()]);
+        assert_eq!(restarted.selected_profile.as_ref(), Some(&via.id));
+        // Without enabled relays, the SSH selection stays.
+        let mut restarted =
+            EndpointCatalog::load_from_paths(&catalog_path, &no_dial_in, &selection_path).unwrap();
+        restarted.set_relays_enabled(false);
+        assert_eq!(restarted.selected_profile.as_ref(), Some(&keep));
+        assert_eq!(restarted.pending_selection, None);
+        std::fs::remove_dir_all(catalog_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn dial_in_selection_is_validated_against_enabled_dial_in_machines() {
+        let catalog_path = path("dial-in-selection-validity");
+        let dial_in_path = catalog_path.with_file_name("dial-in-machines.json");
+        let selection_path = catalog_path.with_file_name("selection.json");
+        let _ = std::fs::remove_dir_all(catalog_path.parent().unwrap());
+        let mut dial_in = DialInCatalog::default();
+        let laptop = dial_in.add("Laptop", "default", &[]).unwrap();
+        dial_in.store_to_path(&dial_in_path).unwrap();
+        let mut catalog =
+            EndpointCatalog::load_from_paths(&catalog_path, &dial_in_path, &selection_path)
+                .unwrap();
+        assert!(catalog.ssh.is_empty());
+        assert!(!catalog.has_enabled_ssh());
+        assert!(catalog.has_enabled_machines());
+        assert_eq!(
+            catalog.machine_summaries(),
+            vec![SavedMachineSummary {
+                id: laptop.clone(),
+                label: "Laptop".into(),
+                enabled: true,
+                kind: SavedMachineKind::DialIn,
+            }]
+        );
+        assert!(catalog.select_ssh(&laptop));
+        catalog.store_selection_to_path(&selection_path).unwrap();
+
+        dial_in.set_enabled(&laptop, false);
+        dial_in.store_to_path(&dial_in_path).unwrap();
+        let mut catalog =
+            EndpointCatalog::load_from_paths(&catalog_path, &dial_in_path, &selection_path)
+                .unwrap();
+        assert_eq!(catalog.selected_profile, None);
+        assert!(!catalog.has_enabled_machines());
+        assert!(!catalog.select_ssh(&laptop));
+
+        // An unusable dial-in catalog never costs the SSH machines.
+        let ssh = catalog.add_ssh("Build", "build", "default").unwrap();
+        catalog.store_to_path(&catalog_path).unwrap();
+        std::fs::write(&dial_in_path, b"{not json").unwrap();
+        let catalog =
+            EndpointCatalog::load_from_paths(&catalog_path, &dial_in_path, &selection_path)
+                .unwrap();
+        assert_eq!(catalog.ssh[0].id, ssh);
+        assert!(catalog.dial_in.is_empty());
+        std::fs::remove_dir_all(catalog_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn dial_in_machines_colliding_with_ssh_ids_are_ignored() {
+        let mut catalog = EndpointCatalog::default();
+        let id = catalog.add_ssh("Build", "build", "default").unwrap();
+        let colliding = DialInMachine {
+            id: id.clone(),
+            ..DialInMachine::new("Laptop", "default").unwrap()
+        };
+        let other = DialInMachine::new("Desktop", "default").unwrap();
+        let kept = dial_in_without_id_collisions(&catalog.ssh, vec![colliding, other.clone()]);
+        assert_eq!(kept, vec![other]);
     }
 
     #[test]
@@ -538,7 +1023,12 @@ mod tests {
         catalog.store_to_path(&catalog_path).unwrap();
         std::fs::write(&selection_path, b"not json").unwrap();
 
-        let loaded = EndpointCatalog::load_from_paths(&catalog_path, &selection_path).unwrap();
+        let loaded = EndpointCatalog::load_from_paths(
+            &catalog_path,
+            &no_dial_in(&catalog_path),
+            &selection_path,
+        )
+        .unwrap();
         assert_eq!(loaded.ssh.len(), 1);
         assert_eq!(loaded.ssh[0].id, id);
         assert_eq!(loaded.selected_profile, None);
@@ -565,7 +1055,12 @@ mod tests {
         )
         .unwrap();
 
-        let loaded = EndpointCatalog::load_from_paths(&catalog_path, &selection_path).unwrap();
+        let loaded = EndpointCatalog::load_from_paths(
+            &catalog_path,
+            &no_dial_in(&catalog_path),
+            &selection_path,
+        )
+        .unwrap();
         assert_eq!(loaded.ssh[0].id, saved);
         assert_eq!(loaded.selected_profile, None);
         std::fs::remove_dir_all(catalog_path.parent().unwrap()).unwrap();

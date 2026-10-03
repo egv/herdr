@@ -91,6 +91,32 @@ impl SavedSshApiBridge {
         })
     }
 
+    /// An API bridge to dial-in machine `link_id` of a relay hub, through
+    /// `herdr link-connect --kind api` there. Uses the relay's metadata cache.
+    pub(crate) fn start_via(
+        relay_id: &str,
+        relay_target: &str,
+        link_id: &str,
+        via_id: &str,
+        use_cached_metadata: bool,
+    ) -> io::Result<Self> {
+        let herdr = super::relay::relay_herdr(relay_id, relay_target, use_cached_metadata)?;
+        let path = super::relay::via_bridge_path(true, via_id);
+        let bridge = SshStdioBridge::start_command(
+            relay_target.to_owned(),
+            super::relay::link_connect_command(&herdr.executable, link_id, "api"),
+            path.clone(),
+            herdr.ssh.options(),
+            true,
+        )?;
+        Ok(Self {
+            path,
+            bridge,
+            metadata_cache: herdr.cache,
+            used_cached_metadata: herdr.cached,
+        })
+    }
+
     pub(crate) fn socket_path(&self) -> &std::path::Path {
         &self.path
     }

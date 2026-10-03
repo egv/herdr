@@ -5,24 +5,52 @@ use crossterm::style::{Attribute, SetAttribute};
 use crossterm::{cursor, execute, terminal};
 use serde::Serialize;
 
-use crate::client::endpoint::{EndpointCatalog, ProfileId, MAX_LABEL_BYTES};
+use super::target::SavedMachineRef;
+use crate::client::endpoint::{EndpointCatalog, ProfileId, SavedSshEndpoint, MAX_LABEL_BYTES};
+use crate::remote::link::status::{ErrorRecord, SlaveInfo};
+use dial_in::{authorize, DIAL_IN_KIND};
+
+mod agent;
+mod dial_in;
+pub(super) mod relay;
+mod update;
 
 const HELP: &str = "Usage:
   herdr machine list [--json]
   herdr machine status [<label-or-id>] [--json]
-  herdr machine reconnect <label-or-id>
+  herdr machine reconnect <label-or-id> [--wait <seconds>]
   herdr machine add <ssh-target> [--label <label>] [--remote-session <name>]
+  herdr machine add --dial-in --label <label> [--remote-session <name>] [--hub <ssh-target>] [--agent-forwarding] [--authorize-key -] [--json]
+  herdr machine authorize <label-or-id> '<public key line>' [--herdr-path <path>] [--write [--authorized-keys <path>] [--replace]]
+  herdr machine agent-forwarding <label-or-id> on|off
+  herdr machine update <label-or-id> [--yes] [--restart-server]
   herdr machine rename <profile-id> --label <label>
-  herdr machine remove <profile-id>
+  herdr machine remove <profile-id> [--revoke [--authorized-keys <path>]]
   herdr machine enable <profile-id>
   herdr machine disable <profile-id>
+  herdr machine dial setup|run|list|status|remove|service ...
+  herdr machine relay add <ssh-target> [--label <label>]
+  herdr machine relay list|remove|rename|enable|disable ...
 
 Add prepares the remote Herdr installation and starts its server before saving.
 Missing or incompatible installations require approval in an interactive terminal.
 Changes apply automatically to open local Herdr clients.
 Removing or disabling a machine leaves its remote sessions running.
 Saved machines contain only a label, SSH target, explicit Herdr session, and enabled state.
-SSH credentials and key material remain owned by OpenSSH.";
+SSH credentials and key material remain owned by OpenSSH.
+
+Dial-in machines connect to this hub over SSH themselves, for machines this hub
+cannot reach. Add one here, run the printed `herdr machine dial setup` command on
+that machine, then run the `herdr machine authorize` command it prints here and
+append the printed line to ~/.ssh/authorized_keys, or pass --write to let Herdr
+add it. `herdr machine dial setup --pair` on that machine does all of this over
+your own SSH login to this hub.
+
+Relay hubs: when the hub that dial-in machines connect to is reachable over SSH
+from here, `herdr machine relay add <hub>` makes its dial-in machines available
+here as <relay>/<machine>. Management commands on such a machine run on the hub.";
+
+const SSH_KIND: &str = "ssh";
 
 #[derive(Serialize)]
 struct MachineListRow<'a> {
@@ -35,6 +63,15 @@ struct MachineListRow<'a> {
 }
 
 pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
+    if let Some(verb) = args
+        .first()
+        .map(String::as_str)
+        .filter(|verb| relay::FORWARDED_VERBS.contains(verb))
+    {
+        if let Some(code) = relay::forward(verb, &args[1..])? {
+            return Ok(code);
+        }
+    }
     match args.first().map(String::as_str) {
         Some("list") => list(&args[1..]),
         Some("status") => status(&args[1..]),
@@ -44,6 +81,11 @@ pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
         Some("remove") => remove(&args[1..]),
         Some("enable") => set_enabled(&args[1..], true),
         Some("disable") => set_enabled(&args[1..], false),
+        Some("dial") => super::machine_dial::run_dial_command(&args[1..]),
+        Some("relay") => relay::run_relay_command(&args[1..]),
+        Some("authorize") => authorize(&args[1..]),
+        Some("agent-forwarding") => agent::agent_forwarding(&args[1..]),
+        Some("update") => update::update(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{HELP}");
             Ok(0)
@@ -65,6 +107,9 @@ fn list(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let catalog = load_catalog()?;
+    // A broken dial-in catalog is reported on stderr only: listing keeps the
+    // exit status it had before dial-in machines existed.
+    let (dial_in, _) = dial_in::load_catalog_or_warn();
     let rows = catalog
         .ssh
         .iter()
@@ -77,14 +122,29 @@ fn list(args: &[String]) -> std::io::Result<i32> {
             selected: catalog.selected_profile.as_ref() == Some(&profile.id),
         })
         .collect::<Vec<_>>();
+    let dial_in_rows = dial_in::list_rows(&dial_in, catalog.selected_profile.as_ref());
+    // Asks each enabled relay hub once; none saved means no SSH at all.
+    let via_rows = relay::via_list_rows(
+        catalog
+            .selected_profile
+            .as_ref()
+            .or(catalog.pending_selection.as_ref()),
+    );
     if json {
+        let mut entries = serde_json::to_value(dial_in::list_entries(rows, dial_in_rows))
+            .map_err(std::io::Error::other)?;
+        if let serde_json::Value::Array(entries) = &mut entries {
+            for row in &via_rows {
+                entries.push(serde_json::to_value(row).map_err(std::io::Error::other)?);
+            }
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(&rows).map_err(std::io::Error::other)?
+            serde_json::to_string_pretty(&entries).map_err(std::io::Error::other)?
         );
         return Ok(0);
     }
-    if rows.is_empty() {
+    if rows.is_empty() && dial_in_rows.is_empty() && via_rows.is_empty() {
         println!("No saved SSH machines.");
         return Ok(0);
     }
@@ -95,6 +155,8 @@ fn list(args: &[String]) -> std::io::Result<i32> {
             row.id, row.label, row.target, row.session, state
         );
     }
+    dial_in::print_list_rows(&dial_in_rows);
+    relay::print_via_rows(&via_rows);
     Ok(0)
 }
 
@@ -104,6 +166,44 @@ struct MachineStatusRow<'a> {
     label: &'a str,
     status: &'static str,
     error: Option<String>,
+    kind: &'static str,
+    // Dial-in facts; absent from SSH rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slave: Option<SlaveInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connected_since_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<ErrorRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_stream_error: Option<ErrorRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim_conflict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_forwarding: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_leases: Option<u32>,
+}
+
+impl<'a> MachineStatusRow<'a> {
+    fn ssh(profile: &'a SavedSshEndpoint, status: &'static str, error: Option<String>) -> Self {
+        Self {
+            id: profile.id.as_str(),
+            label: &profile.label,
+            status,
+            error,
+            kind: SSH_KIND,
+            slave: None,
+            server_version: None,
+            connected_since_ms: None,
+            last_error: None,
+            last_stream_error: None,
+            claim_conflict: None,
+            agent_forwarding: None,
+            agent_leases: None,
+        }
+    }
 }
 
 fn status(args: &[String]) -> std::io::Result<i32> {
@@ -120,17 +220,24 @@ fn status(args: &[String]) -> std::io::Result<i32> {
         }
     }
     let catalog = load_catalog()?;
-    let profiles = match selector {
-        Some(selector) => match super::target::resolve_machine(&catalog.ssh, selector) {
-            Ok(profile) => vec![profile],
-            Err(error) => {
-                eprintln!("{error}");
-                return Ok(2);
+    let (dial_in, dial_in_failed) = dial_in::load_catalog_or_warn();
+    let (profiles, machines) = match selector {
+        Some(selector) => {
+            match super::target::resolve_saved_machine(&catalog.ssh, &dial_in.machines, selector) {
+                Ok(SavedMachineRef::Ssh(profile)) => (vec![profile], Vec::new()),
+                Ok(SavedMachineRef::DialIn(machine)) => (Vec::new(), vec![machine]),
+                Err(error) => {
+                    eprintln!("{error}");
+                    return Ok(2);
+                }
             }
-        },
-        None => catalog.ssh.iter().collect(),
+        }
+        None => (
+            catalog.ssh.iter().collect(),
+            dial_in.machines.iter().collect(),
+        ),
     };
-    let rows = profiles
+    let mut rows = profiles
         .into_iter()
         .map(|profile| {
             let (status, error) = if !profile.enabled {
@@ -149,14 +256,10 @@ fn status(args: &[String]) -> std::io::Result<i32> {
                     }
                 }
             };
-            MachineStatusRow {
-                id: profile.id.as_str(),
-                label: &profile.label,
-                status,
-                error,
-            }
+            MachineStatusRow::ssh(profile, status, error)
         })
         .collect::<Vec<_>>();
+    rows.extend(machines.into_iter().map(dial_in::status_row));
     if json {
         println!(
             "{}",
@@ -165,7 +268,11 @@ fn status(args: &[String]) -> std::io::Result<i32> {
     } else {
         for row in &rows {
             println!("{}\t{}\t{}", row.id, row.label, row.status);
-            if let Some(error) = &row.error {
+            if row.kind == DIAL_IN_KIND {
+                for line in row.dial_in_details() {
+                    println!("  {line}");
+                }
+            } else if let Some(error) = &row.error {
                 println!("  {}", error.escape_debug());
             }
         }
@@ -173,23 +280,61 @@ fn status(args: &[String]) -> std::io::Result<i32> {
             println!("No saved SSH machines.");
         }
     }
-    Ok(i32::from(rows.iter().any(|row| row.error.is_some())))
+    Ok(status_exit_code(
+        selector.is_some(),
+        dial_in_failed,
+        rows.iter().any(|row| row.error.is_some()),
+    ))
 }
+
+/// 1 when a reported machine has an error. A broken dial-in catalog counts
+/// only for the whole-list status: a selector that resolved (necessarily to
+/// an SSH machine then) keeps the SSH-only result.
+fn status_exit_code(selector_given: bool, dial_in_failed: bool, any_row_error: bool) -> i32 {
+    i32::from(any_row_error || (dial_in_failed && !selector_given))
+}
+
+/// How long `reconnect` waits for a dial-in machine without `--wait`.
+const DIAL_IN_RECONNECT_WAIT: u64 = 30;
 
 fn reconnect(args: &[String]) -> std::io::Result<i32> {
     use std::io::IsTerminal;
-    let [selector] = args else {
-        eprintln!("usage: herdr machine reconnect <label-or-id>");
-        return Ok(2);
-    };
-    let catalog = load_catalog()?;
-    let profile = match super::target::resolve_machine(&catalog.ssh, selector) {
-        Ok(profile) => profile,
-        Err(error) => {
-            eprintln!("{error}");
+    const USAGE: &str = "usage: herdr machine reconnect <label-or-id> [--wait <seconds>]";
+    let args = super::expand_equals_args(args, &["--wait"]);
+    let (selector, wait) = match args.as_slice() {
+        [selector] if !selector.starts_with('-') => (selector, None),
+        [selector, flag, seconds] | [flag, seconds, selector] if flag == "--wait" => {
+            match seconds.parse::<u64>() {
+                Ok(seconds) => (selector, Some(seconds)),
+                Err(_) => {
+                    eprintln!("--wait takes a number of seconds\n{USAGE}");
+                    return Ok(2);
+                }
+            }
+        }
+        _ => {
+            eprintln!("{USAGE}");
             return Ok(2);
         }
     };
+    let catalog = load_catalog()?;
+    let (dial_in, _) = dial_in::load_catalog_or_warn();
+    let profile =
+        match super::target::resolve_saved_machine(&catalog.ssh, &dial_in.machines, selector) {
+            Ok(SavedMachineRef::Ssh(_)) if wait.is_some() => {
+                eprintln!("error: --wait applies only to dial-in machines");
+                return Ok(2);
+            }
+            Ok(SavedMachineRef::Ssh(profile)) => profile,
+            Ok(SavedMachineRef::DialIn(machine)) => {
+                let wait = wait.unwrap_or(DIAL_IN_RECONNECT_WAIT);
+                return dial_in::reconnect(machine, std::time::Duration::from_secs(wait));
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                return Ok(2);
+            }
+        };
     if !std::io::stdin().is_terminal() {
         eprintln!("reconnect requires an interactive terminal; use herdr machine status for noninteractive checks");
         return Ok(2);
@@ -288,7 +433,9 @@ fn check_default_label(catalog: &EndpointCatalog, label: &str) -> Result<(), Str
             "default machine name '{label}' is longer than {MAX_LABEL_BYTES} bytes; pass --label to choose a name"
         ));
     }
-    if catalog.ssh.iter().any(|profile| profile.label == label) {
+    if catalog.ssh.iter().any(|profile| profile.label == label)
+        || dial_in::check_label_free_in_dial_in(&catalog.dial_in, label).is_err()
+    {
         return Err(format!(
             "a machine named '{label}' already exists; pass --label to choose another name"
         ));
@@ -296,7 +443,24 @@ fn check_default_label(catalog: &EndpointCatalog, label: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Default labels must be unique; explicit labels may repeat among SSH
+/// machines (as before dial-in machines existed) but never a dial-in label.
+fn check_add_label(
+    catalog: &EndpointCatalog,
+    label: &str,
+    label_is_default: bool,
+) -> Result<(), String> {
+    if label_is_default {
+        check_default_label(catalog, label)
+    } else {
+        dial_in::check_label_free_in_dial_in(&catalog.dial_in, label)
+    }
+}
+
 fn add(args: &[String]) -> std::io::Result<i32> {
+    if args.iter().any(|arg| arg == "--dial-in") {
+        return dial_in::add(args);
+    }
     let AddArgs {
         target,
         label,
@@ -332,11 +496,9 @@ fn add(args: &[String]) -> std::io::Result<i32> {
     let label_is_default = label.is_none();
     let label = label.unwrap_or_else(|| default_label(&target, &session));
     let mut catalog = load_catalog()?;
-    if label_is_default {
-        if let Err(error) = check_default_label(&catalog, &label) {
-            eprintln!("error: {error}");
-            return Ok(2);
-        }
+    if let Err(error) = check_add_label(&catalog, &label, label_is_default) {
+        eprintln!("error: {error}");
+        return Ok(2);
     }
     match catalog.add_ssh(label.clone(), &target, session.clone()) {
         Ok(_) => {}
@@ -363,11 +525,9 @@ fn add(args: &[String]) -> std::io::Result<i32> {
             "remote prepared, but machine was not saved: {error}"
         ))
     })?;
-    if label_is_default {
-        if let Err(error) = check_default_label(&catalog, &label) {
-            eprintln!("error: {error}; machine was not saved");
-            return Ok(2);
-        }
+    if let Err(error) = check_add_label(&catalog, &label, label_is_default) {
+        eprintln!("error: {error}; machine was not saved");
+        return Ok(2);
     }
     let id = match catalog.add_ssh(label, &target, &session) {
         Ok(id) => id,
@@ -485,12 +645,16 @@ fn rename(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let mut catalog = load_catalog()?;
+    if catalog.ssh.iter().any(|profile| profile.id == id) {
+        // Labels stay unique across SSH and dial-in machines so each resolves.
+        if let Err(error) = dial_in::check_label_free_in_dial_in(&catalog.dial_in, label) {
+            eprintln!("error: {error}");
+            return Ok(2);
+        }
+    }
     match catalog.rename_ssh(&id, label) {
         Ok(true) => {}
-        Ok(false) => {
-            eprintln!("machine profile {id} was not found");
-            return Ok(1);
-        }
+        Ok(false) => return dial_in::rename(&catalog, &id, label),
         Err(error) => {
             eprintln!("error: {error}");
             return Ok(2);
@@ -502,10 +666,23 @@ fn rename(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn remove(args: &[String]) -> std::io::Result<i32> {
-    let Some(id) = one_profile_id(args, "usage: herdr machine remove <profile-id>")? else {
+    const USAGE: &str =
+        "usage: herdr machine remove <profile-id> [--revoke [--authorized-keys <path>]]";
+    let (args, revoke) = match dial_in::split_revoke_args(args) {
+        Ok(split) => split,
+        Err(error) => {
+            eprintln!("{error}\n{USAGE}");
+            return Ok(2);
+        }
+    };
+    let Some(id) = one_profile_id(&args, USAGE)? else {
         return Ok(2);
     };
     let mut catalog = load_catalog()?;
+    if revoke.is_some() && catalog.ssh.iter().any(|profile| profile.id == id) {
+        eprintln!("error: --revoke applies only to dial-in machines");
+        return Ok(2);
+    }
     let previous_selection = catalog.selected_profile.clone();
     let metadata_cache = catalog
         .ssh
@@ -520,8 +697,7 @@ fn remove(args: &[String]) -> std::io::Result<i32> {
         })
         .transpose()?;
     if !catalog.remove_ssh(&id) {
-        eprintln!("machine profile {id} was not found");
-        return Ok(1);
+        return dial_in::remove(&catalog, previous_selection.as_ref(), &id, revoke.as_ref());
     }
     store_catalog(&catalog)?;
     if let Some(cache) = metadata_cache {
@@ -543,8 +719,7 @@ fn set_enabled(args: &[String], enabled: bool) -> std::io::Result<i32> {
     let mut catalog = load_catalog()?;
     let previous_selection = catalog.selected_profile.clone();
     if !catalog.set_enabled(&id, enabled) {
-        eprintln!("machine profile {id} was not found");
-        return Ok(1);
+        return dial_in::set_enabled(&mut catalog, &id, enabled);
     }
     store_catalog(&catalog)?;
     if catalog.selected_profile != previous_selection {
@@ -656,6 +831,26 @@ mod tests {
     }
 
     #[test]
+    fn ssh_labels_never_repeat_a_dial_in_label() {
+        let mut catalog = EndpointCatalog::default();
+        catalog.add_ssh("workbox", "workbox", "default").unwrap();
+        catalog.dial_in =
+            vec![crate::client::endpoint::DialInMachine::new("build", "default").unwrap()];
+
+        let taken = check_default_label(&catalog, "build").unwrap_err();
+        assert!(taken.contains("--label"), "{taken}");
+        let explicit = check_add_label(&catalog, " build ", false).unwrap_err();
+        assert!(
+            explicit.contains("dial-in machine named 'build'"),
+            "{explicit}"
+        );
+        // Explicit SSH duplicates keep their upstream behavior.
+        assert!(check_add_label(&catalog, "workbox", false).is_ok());
+        assert!(check_add_label(&catalog, "workbox", true).is_err());
+        assert!(check_add_label(&catalog, "desk", true).is_ok());
+    }
+
+    #[test]
     fn add_parser_rejects_incomplete_duplicate_and_extra_arguments() {
         for args in [
             vec![],
@@ -686,6 +881,36 @@ mod tests {
         assert!(one_profile_id(&["build.example".into()], "usage")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn a_broken_dial_in_catalog_fails_only_the_whole_list_status() {
+        assert_eq!(status_exit_code(false, false, false), 0);
+        assert_eq!(status_exit_code(false, true, false), 1);
+        assert_eq!(status_exit_code(true, true, false), 0);
+        assert_eq!(status_exit_code(true, true, true), 1);
+        assert_eq!(status_exit_code(true, false, true), 1);
+    }
+
+    #[test]
+    fn ssh_status_rows_only_gain_a_kind_field() {
+        let profile = SavedSshEndpoint::new("Build", "build", "default").unwrap();
+        let value = serde_json::to_value(MachineStatusRow::ssh(
+            &profile,
+            "error",
+            Some("boom".into()),
+        ))
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": profile.id.as_str(),
+                "label": "Build",
+                "status": "error",
+                "error": "boom",
+                "kind": "ssh"
+            })
+        );
     }
 
     #[test]

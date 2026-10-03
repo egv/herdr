@@ -41,7 +41,7 @@ fn agent_path_for(api_path: &Path) -> PathBuf {
     path.into()
 }
 
-fn usable_socket(path: &Path) -> bool {
+pub(crate) fn usable_socket(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|metadata| {
         // The API is user-private; do not redirect that user's panes to another user's agent.
         metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() }

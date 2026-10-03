@@ -31,6 +31,7 @@ mod image_files;
 mod input;
 mod loop_config;
 mod notifications;
+mod relay_reload;
 mod shell;
 mod shell_runtime;
 mod startup;
@@ -222,7 +223,7 @@ fn run_client_with_mode(
     } else {
         endpoint::EndpointCatalog::default()
     };
-    let federated = endpoint_catalog.has_enabled_ssh();
+    let federated = endpoint_catalog.has_enabled_machines();
 
     let initial_stream = match crate::ipc::connect_local_stream(&socket_path) {
         Ok(stream) => Some(stream),
@@ -470,10 +471,10 @@ async fn run_client_loop(
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
     };
-    let mut federated = endpoint_catalog.has_enabled_ssh();
+    let mut federated = endpoint_catalog.has_enabled_machines();
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
-        shell.set_endpoint_catalog(&endpoint_catalog.ssh);
+        shell.set_endpoint_machines(&endpoint_catalog.machine_summaries());
         shell.set_endpoint_methods_for(
             &endpoint::ClientEndpointId::Local,
             initial
@@ -615,8 +616,11 @@ async fn run_client_loop(
     } else {
         endpoint::EndpointRegistry::empty()
     };
-    let mut supervisors =
-        endpoint::EndpointSupervisors::new(&endpoint_catalog.ssh, std::time::Instant::now());
+    let mut supervisors = endpoint::EndpointSupervisors::new(
+        &endpoint_catalog.ssh,
+        &endpoint_catalog.dial_in,
+        std::time::Instant::now(),
+    );
     if federated {
         supervisors.add_local(
             client_socket_path(),
@@ -638,7 +642,7 @@ async fn run_client_loop(
     let mut next_surface_serial = 1_u64;
     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
     let mut scheduled_activation = None;
-    let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
+    let mut pending_catalog: Option<catalog_reload::SavedMachinesReload> = None;
     if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
         catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
     }
@@ -654,77 +658,78 @@ async fn run_client_loop(
     while !should_quit.load(Ordering::Acquire) {
         if pending_activation.is_none() {
             if let Some(reload) = pending_catalog.take() {
-                match reload {
-                    Ok(profiles) => {
-                        let now = std::time::Instant::now();
-                        if !federated && profiles.iter().any(|profile| profile.enabled) {
-                            // Keep Local recovery once enabled, even after removing the last SSH profile.
-                            federated = true;
-                            supervisors.add_local(
-                                client_socket_path(),
-                                write_stream
-                                    .connection(&endpoint::ClientEndpointId::Local)
-                                    .map(|connection| connection.generation),
-                                now,
+                // Each catalog file fails on its own; an unreadable one keeps its machines.
+                let (profiles, dial_in, via, reload_errors) = reload.resolve(&endpoint_catalog);
+                let now = std::time::Instant::now();
+                if !federated
+                    && (profiles.iter().any(|profile| profile.enabled)
+                        || dial_in.iter().any(|machine| machine.enabled)
+                        || !via.is_empty())
+                {
+                    // Keep Local recovery once enabled, even after removing the last saved machine.
+                    federated = true;
+                    supervisors.add_local(
+                        client_socket_path(),
+                        write_stream
+                            .connection(&endpoint::ClientEndpointId::Local)
+                            .map(|connection| connection.generation),
+                        now,
+                    );
+                    if write_stream
+                        .connection(&endpoint::ClientEndpointId::Local)
+                        .is_some_and(|connection| {
+                            !connection.negotiation.supports_surface_interest()
+                        })
+                    {
+                        if let Some(shell) = state.shell.as_mut() {
+                            shell.receive_endpoint_unavailable(
+                                "Update the Local server before switching between machines".into(),
                             );
-                            if write_stream
-                                .connection(&endpoint::ClientEndpointId::Local)
-                                .is_some_and(|connection| {
-                                    !connection.negotiation.supports_surface_interest()
-                                })
-                            {
-                                if let Some(shell) = state.shell.as_mut() {
-                                    shell.receive_endpoint_unavailable(
-                                        "Update the Local server before switching between machines"
-                                            .into(),
-                                    );
-                                }
-                            }
-                        }
-                        let active_removed = catalog_reload::apply_profiles(
-                            &mut state,
-                            &mut write_stream,
-                            &mut endpoint_commands,
-                            &mut supervisors,
-                            &mut endpoint_catalog,
-                            profiles,
-                            now,
-                        );
-                        if active_removed {
-                            clear_endpoint_host_effects(
-                                &mut state,
-                                &host_mouse_capture_active,
-                                &host_sgr_pixels_active,
-                            );
-                            scheduled_activation = None;
-                            if state.shell.as_ref().is_some_and(|shell| {
-                                shell.endpoint_projection_available(
-                                    &endpoint::ClientEndpointId::Local,
-                                )
-                            }) && write_stream
-                                .connection(&endpoint::ClientEndpointId::Local)
-                                .is_some()
-                            {
-                                scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
-                                    endpoint_id: endpoint::ClientEndpointId::Local,
-                                    target: None,
-                                    force: true,
-                                });
-                            } else {
-                                present_handoff_unavailable(
-                                    &mut state,
-                                    "Local is unavailable; reconnecting".into(),
-                                );
-                            }
                         }
                     }
-                    Err(error) => {
-                        warn!(%error, "saved machines could not be reloaded; keeping current connections");
-                        if let Some(shell) = state.shell.as_mut() {
-                            shell.receive_endpoint_unavailable(format!(
-                                "Saved machines could not be reloaded; keeping current connections: {error}"
-                            ));
-                        }
+                }
+                let active_removed = catalog_reload::apply_profiles(
+                    &mut state,
+                    &mut write_stream,
+                    &mut endpoint_commands,
+                    &mut supervisors,
+                    &mut endpoint_catalog,
+                    profiles,
+                    dial_in,
+                    via,
+                    now,
+                );
+                if active_removed {
+                    clear_endpoint_host_effects(
+                        &mut state,
+                        &host_mouse_capture_active,
+                        &host_sgr_pixels_active,
+                    );
+                    scheduled_activation = None;
+                    if state.shell.as_ref().is_some_and(|shell| {
+                        shell.endpoint_projection_available(&endpoint::ClientEndpointId::Local)
+                    }) && write_stream
+                        .connection(&endpoint::ClientEndpointId::Local)
+                        .is_some()
+                    {
+                        scheduled_activation = Some(ClientLoopEvent::ActivateEndpoint {
+                            endpoint_id: endpoint::ClientEndpointId::Local,
+                            target: None,
+                            force: true,
+                        });
+                    } else {
+                        present_handoff_unavailable(
+                            &mut state,
+                            "Local is unavailable; reconnecting".into(),
+                        );
+                    }
+                }
+                for error in reload_errors {
+                    warn!(%error, "saved machines could not be reloaded; keeping current connections");
+                    if let Some(shell) = state.shell.as_mut() {
+                        shell.receive_endpoint_unavailable(format!(
+                            "Saved machines could not be reloaded; keeping current connections: {error}"
+                        ));
                     }
                 }
                 apply_client_shell_input_source_changes(&mut state, &mut prefix_input_source);
@@ -800,6 +805,20 @@ async fn run_client_loop(
 
         match event {
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
+            ClientLoopEvent::DialInPresence { id } => {
+                // Not deferred during activation: a wake only schedules a
+                // generation-fenced connection attempt.
+                supervisors.wake(&endpoint::ClientEndpointId::Ssh(id), now);
+            }
+            ClientLoopEvent::RelayNotice(message) => {
+                warn!(%message, "relay hub unavailable");
+                if let Some(frame) = state.shell.as_mut().and_then(|shell| {
+                    shell.receive_endpoint_unavailable(message);
+                    shell.compose(state.reported_size.0, state.reported_size.1)
+                }) {
+                    state.present_frame(frame);
+                }
+            }
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
                 let image_bridge_active = endpoint_accepts_local_images(

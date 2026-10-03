@@ -53,7 +53,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
-use super::endpoint::{ClientEndpointId, ClientEndpointStatus, SavedSshEndpoint};
+#[cfg(test)]
+use super::endpoint::SavedSshEndpoint;
+use super::endpoint::{
+    ClientEndpointId, ClientEndpointStatus, SavedMachineKind, SavedMachineSummary,
+};
 use crate::app::state::Palette;
 use crate::config::{
     Config, LiveKeybindConfig, SidebarCollapsedModeConfig, SpacesSidebarConfig,

@@ -24,7 +24,13 @@ pub(super) enum ClientLoopEvent {
         generation: u64,
     },
     EndpointSupervisor(endpoint::EndpointSupervisorEvent),
-    EndpointCatalog(Result<Vec<endpoint::SavedSshEndpoint>, String>),
+    EndpointCatalog(catalog_reload::SavedMachinesReload),
+    /// A dial-in machine's link reached `connected` with a newer epoch.
+    DialInPresence {
+        id: endpoint::ProfileId,
+    },
+    /// A relay hub could not be listed; its machines keep their last list.
+    RelayNotice(String),
     ActivateEndpoint {
         endpoint_id: endpoint::ClientEndpointId,
         target: Option<shell::ClientEndpointFocusTarget>,

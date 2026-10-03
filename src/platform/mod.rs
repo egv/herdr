@@ -337,6 +337,185 @@ pub(crate) use unix_common::{
 mod client_state;
 pub(crate) use client_state::{create_private_state_file, replace_file, sync_parent_directory};
 
+// Dial-in link helpers. Dial-in machines are Unix-only in M1; other targets
+// compile the same names and report `Unsupported`.
+#[cfg(unix)]
+pub(crate) use unix_common::{
+    current_uid, ensure_private_directory, file_identity, file_is_owned_by_current_user,
+    file_is_private_to_current_user, local_socket_path_fits, reexec_process, shutdown_local_stream,
+    take_stdout_unbuffered, try_lock_exclusive, verify_private_directory,
+};
+
+/// Whether `path` (followed through symlinks) is a socket owned by the effective user.
+#[cfg(unix)]
+pub(crate) use ssh_agent::usable_socket as socket_is_owned_by_current_user;
+
+#[cfg(not(unix))]
+pub(crate) fn socket_is_owned_by_current_user(_path: &std::path::Path) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+pub(crate) fn reexec_process(
+    _path: &std::path::Path,
+    _args: &[String],
+    _env: &[(String, Option<String>)],
+) -> std::io::Error {
+    dial_in_unsupported()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn file_identity(_path: &std::path::Path) -> std::io::Result<[u64; 5]> {
+    Err(dial_in_unsupported())
+}
+
+/// A user-level service that keeps `herdr machine dial run <name>` running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DialServiceSpec {
+    pub(crate) name: String,
+    pub(crate) herdr_path: std::path::PathBuf,
+    pub(crate) log_path: std::path::PathBuf,
+    /// Environment the service must run with (Herdr's config and state roots).
+    pub(crate) env: Vec<(String, String)>,
+}
+
+/// What the service manager reported for a dial service.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DialServiceReport {
+    pub(crate) unit_path: Option<std::path::PathBuf>,
+    pub(crate) active: Option<bool>,
+    pub(crate) notes: Vec<String>,
+}
+
+// systemd (Linux) and launchd (macOS) implement dial services.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn dial_service_install(
+    _spec: &DialServiceSpec,
+    _start: bool,
+) -> std::io::Result<DialServiceReport> {
+    Err(dial_service_unsupported())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn dial_service_uninstall(_name: &str) -> std::io::Result<DialServiceReport> {
+    Err(dial_service_unsupported())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn dial_service_status(_name: &str) -> std::io::Result<DialServiceReport> {
+    Err(dial_service_unsupported())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn dial_service_installed(_name: &str) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn dial_service_unsupported() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "dial-in services are not supported on this platform yet",
+    )
+}
+
+#[cfg(not(unix))]
+pub(crate) fn shutdown_local_stream(
+    _stream: &crate::ipc::LocalStream,
+    _how: std::net::Shutdown,
+) -> std::io::Result<()> {
+    Err(dial_in_unsupported())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn take_stdout_unbuffered() -> std::io::Result<std::fs::File> {
+    Err(dial_in_unsupported())
+}
+
+/// An exclusive advisory lock on a file, released when dropped.
+#[derive(Debug)]
+pub(crate) struct ExclusiveFileLock {
+    file: std::fs::File,
+}
+
+impl ExclusiveFileLock {
+    /// Replaces the lock file contents with this process id (diagnostics only).
+    pub(crate) fn record_pid(&self) -> std::io::Result<()> {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        let mut file = &self.file;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(format!("{}\n", std::process::id()).as_bytes())
+    }
+}
+
+/// Whether the peer of a connected local socket runs as the effective user.
+pub(crate) fn local_stream_peer_is_current_user(
+    stream: &crate::ipc::LocalStream,
+) -> std::io::Result<bool> {
+    let peer = local_stream_peer_uid(stream)?;
+    Ok(current_uid() == Some(peer))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn local_stream_peer_uid(_stream: &crate::ipc::LocalStream) -> std::io::Result<u32> {
+    Err(dial_in_unsupported())
+}
+
+#[cfg(not(unix))]
+fn dial_in_unsupported() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "dial-in machines require Unix in this version of Herdr",
+    )
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn dial_in_unsupported() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "local socket peer credentials are unsupported on this platform",
+    )
+}
+
+#[cfg(not(unix))]
+pub(crate) fn current_uid() -> Option<u32> {
+    None
+}
+
+#[cfg(not(unix))]
+pub(crate) fn local_socket_path_fits(_path: &std::path::Path) -> bool {
+    true
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_private_directory(_path: &std::path::Path) -> std::io::Result<()> {
+    Err(dial_in_unsupported())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn verify_private_directory(_path: &std::path::Path) -> std::io::Result<()> {
+    Err(dial_in_unsupported())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn file_is_owned_by_current_user(_path: &std::path::Path) -> std::io::Result<bool> {
+    Err(dial_in_unsupported())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn file_is_private_to_current_user(_path: &std::path::Path) -> std::io::Result<bool> {
+    Err(dial_in_unsupported())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn try_lock_exclusive(
+    _path: &std::path::Path,
+) -> std::io::Result<Option<ExclusiveFileLock>> {
+    Err(dial_in_unsupported())
+}
+
 #[cfg(not(unix))]
 pub(crate) fn begin_cli_output() {}
 
@@ -726,4 +905,28 @@ pub(crate) fn shared_ssh_control_path(
         std::io::ErrorKind::Unsupported,
         "interactive SSH recovery requires Unix OpenSSH multiplexing",
     ))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod peer_credential_tests {
+    #[test]
+    fn same_process_local_socket_peer_is_current_user() {
+        use interprocess::local_socket::traits::Listener as _;
+
+        let dir = std::env::temp_dir().join(format!("hpeer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        super::ensure_private_directory(&dir).unwrap();
+        let path = dir.join("p.sock");
+        assert!(super::local_socket_path_fits(&path));
+        let listener = crate::ipc::bind_private_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+        assert!(super::local_stream_peer_is_current_user(&client).unwrap());
+        assert!(super::local_stream_peer_is_current_user(&server).unwrap());
+        assert_eq!(super::local_stream_peer_uid(&server).unwrap(), unsafe {
+            libc::geteuid()
+        });
+        drop((client, server, listener));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

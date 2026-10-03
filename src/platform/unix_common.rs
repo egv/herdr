@@ -634,3 +634,405 @@ mod shared_ssh_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+// Dial-in link helpers: private state directories, ownership checks and
+// advisory locks shared by the hub acceptor, the slave dialer and the TUI.
+
+pub(crate) fn current_uid() -> Option<u32> {
+    Some(unsafe { libc::geteuid() })
+}
+
+pub(crate) fn local_socket_path_fits(path: &Path) -> bool {
+    fits_unix_socket_path(path)
+}
+
+fn private_path_error(path: &Path, reason: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("{}: {reason}", path.display()),
+    )
+}
+
+fn check_private_directory_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    require_private_mode: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.file_type().is_symlink() {
+        return Err(private_path_error(path, "private directory is a symlink"));
+    }
+    if !metadata.is_dir() {
+        return Err(private_path_error(
+            path,
+            "private directory path is not a directory",
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(private_path_error(
+            path,
+            "private directory is not owned by the current user",
+        ));
+    }
+    if require_private_mode && metadata.mode() & 0o077 != 0 {
+        return Err(private_path_error(
+            path,
+            "private directory is accessible by other users (expected mode 0700)",
+        ));
+    }
+    Ok(())
+}
+
+/// Creates `path` (and its parents) as a directory private to the effective
+/// user. The leaf must not be a symlink and must be owned by the effective
+/// user; an owned leaf with a wider mode is repaired to 0700.
+pub(crate) fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    check_private_directory_metadata(path, &std::fs::symlink_metadata(path)?, false)?;
+    // Re-check and repair through a descriptor so a swapped-in symlink is never followed.
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                private_path_error(path, "private directory is a symlink")
+            } else {
+                error
+            }
+        })?;
+    let metadata = directory.metadata()?;
+    check_private_directory_metadata(path, &metadata, false)?;
+    if metadata.mode() & 0o7777 != 0o700 {
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Checks that `path` is a directory owned by the effective user, not a
+/// symlink, and inaccessible to group and others. Never creates or repairs.
+/// A missing directory reports `NotFound`; every privacy failure reports
+/// `PermissionDenied`.
+pub(crate) fn verify_private_directory(path: &Path) -> std::io::Result<()> {
+    check_private_directory_metadata(path, &std::fs::symlink_metadata(path)?, true)
+}
+
+/// Whether `path` itself (never a symlink target) is owned by the effective
+/// user. Symlinks report `false`; a missing path reports `NotFound`.
+pub(crate) fn file_is_owned_by_current_user(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok(!metadata.file_type().is_symlink() && metadata.uid() == unsafe { libc::geteuid() })
+}
+
+/// Whether `path` is a regular file (not a symlink) owned by the effective
+/// user and not writable by group or others. A missing path reports `NotFound`.
+pub(crate) fn file_is_private_to_current_user(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok(metadata.file_type().is_file()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o022 == 0)
+}
+
+/// Opens (creating 0600 if needed) `path` and takes a non-blocking exclusive
+/// `flock`. `Ok(None)` means another open file description holds the lock.
+pub(crate) fn try_lock_exclusive(path: &Path) -> std::io::Result<Option<super::ExclusiveFileLock>> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                private_path_error(path, "lock file is a symlink")
+            } else {
+                error
+            }
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(private_path_error(
+            path,
+            "lock file must be a regular file owned by the current user",
+        ));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(super::ExclusiveFileLock { file }));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return Ok(None),
+            _ => return Err(error),
+        }
+    }
+}
+
+impl Drop for super::ExclusiveFileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+
+        // Closing the descriptor also releases the lock; unlock explicitly so
+        // the release does not depend on descriptor lifetime elsewhere.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Shuts down one or both directions of a connected local stream; shutting
+/// down `Write` lets the peer read end-of-file while it can still send.
+pub(crate) fn shutdown_local_stream(
+    stream: &crate::ipc::LocalStream,
+    how: std::net::Shutdown,
+) -> std::io::Result<()> {
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    stream.inner().shutdown(how)
+}
+
+/// Takes ownership of standard output as an unbuffered file. Dropping it
+/// closes stdout so the reader sees end-of-file; nothing may write through
+/// `std::io::stdout()` afterwards.
+pub(crate) fn take_stdout_unbuffered() -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd as _;
+
+    if unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: descriptor 1 is open (checked above) and the caller takes over
+    // its lifetime for the rest of the process.
+    Ok(unsafe { std::fs::File::from_raw_fd(libc::STDOUT_FILENO) })
+}
+
+/// Runs a service-manager command (`systemctl`, `launchctl`) with null
+/// stdin. Dial service code takes it as a parameter so tests can fake it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn run_service_command(
+    mut command: std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    command.stdin(std::process::Stdio::null()).output()
+}
+
+/// Runs `command` through `run`: its stdout on success, else an error that
+/// names the command and quotes its stderr.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn checked_service_command(
+    run: &mut dyn FnMut(std::process::Command) -> std::io::Result<std::process::Output>,
+    command: std::process::Command,
+) -> std::io::Result<String> {
+    let shown = std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let output = run(command).map_err(|error| {
+        std::io::Error::new(error.kind(), format!("failed to run `{shown}`: {error}"))
+    })?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "`{shown}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Device, inode, size, and modification time (seconds, nanoseconds) of
+/// `path`, following symlinks: a new value means the file was replaced or
+/// rewritten.
+pub(crate) fn file_identity(path: &Path) -> std::io::Result<[u64; 5]> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path)?;
+    Ok([
+        metadata.dev(),
+        metadata.ino(),
+        metadata.size(),
+        metadata.mtime() as u64,
+        metadata.mtime_nsec() as u64,
+    ])
+}
+
+/// Replaces this process with `path args...`, applying `env` (`Some` sets a
+/// variable, `None` removes it). Returns only on failure. Descriptors opened
+/// by Rust are close-on-exec, so locks held through them are released.
+pub(crate) fn reexec_process(
+    path: &Path,
+    args: &[String],
+    env: &[(String, Option<String>)],
+) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = std::process::Command::new(path);
+    command.args(args);
+    for (name, value) in env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    command.exec()
+}
+
+#[cfg(test)]
+mod private_state_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    fn scratch(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-private-{}-{}-{name}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[test]
+    fn ensure_private_directory_creates_nested_0700_leaf_and_is_idempotent() {
+        let root = scratch("create");
+        let leaf = root.join("a").join("b").join("leaf");
+        ensure_private_directory(&leaf).unwrap();
+        assert_eq!(mode(&leaf), 0o700);
+        ensure_private_directory(&leaf).unwrap();
+        assert_eq!(mode(&leaf), 0o700);
+        verify_private_directory(&leaf).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ensure_private_directory_repairs_wide_mode_but_verify_refuses_it() {
+        let root = scratch("repair");
+        let leaf = root.join("leaf");
+        std::fs::create_dir(&leaf).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            verify_private_directory(&leaf).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        ensure_private_directory(&leaf).unwrap();
+        assert_eq!(mode(&leaf), 0o700);
+        verify_private_directory(&leaf).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_directory_helpers_refuse_symlinks_and_files() {
+        let root = scratch("refuse");
+        let target = root.join("target");
+        ensure_private_directory(&target).unwrap();
+        let link = root.join("link");
+        symlink(&target, &link).unwrap();
+        assert_eq!(
+            ensure_private_directory(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            verify_private_directory(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let file = root.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            ensure_private_directory(&file).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            verify_private_directory(&root.join("missing"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ownership_checks_ignore_symlink_targets() {
+        let root = scratch("owner");
+        let file = root.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(file_is_owned_by_current_user(&file).unwrap());
+        assert!(file_is_private_to_current_user(&file).unwrap());
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o620)).unwrap();
+        assert!(!file_is_private_to_current_user(&file).unwrap());
+        let link = root.join("link");
+        symlink(&file, &link).unwrap();
+        assert!(!file_is_owned_by_current_user(&link).unwrap());
+        assert!(!file_is_private_to_current_user(&link).unwrap());
+        assert_eq!(
+            file_is_owned_by_current_user(&root.join("missing"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(current_uid(), Some(unsafe { libc::geteuid() }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exclusive_lock_excludes_second_open_until_dropped() {
+        let root = scratch("lock");
+        let path = root.join("link.lock");
+        let first = try_lock_exclusive(&path).unwrap().expect("first lock");
+        assert_eq!(mode(&path), 0o600);
+        assert!(try_lock_exclusive(&path).unwrap().is_none());
+        first.record_pid().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        drop(first);
+        let second = try_lock_exclusive(&path)
+            .unwrap()
+            .expect("lock after release");
+        // Contenders must not truncate the holder's pid record.
+        assert!(try_lock_exclusive(&path).unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        drop(second);
+        let link = root.join("lock-link");
+        symlink(&path, &link).unwrap();
+        assert_eq!(
+            try_lock_exclusive(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

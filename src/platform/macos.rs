@@ -26,6 +26,11 @@ pub(crate) use super::unix_common::{
 mod bootstrap;
 pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_process};
 
+mod dial_service;
+pub(crate) use dial_service::{
+    dial_service_install, dial_service_installed, dial_service_status, dial_service_uninstall,
+};
+
 #[cfg(test)]
 mod config_file_tests;
 
@@ -1146,6 +1151,20 @@ pub fn process_exists(pid: u32) -> bool {
     } else {
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
+}
+
+/// Effective uid of the process on the other end of a local socket (getpeereid).
+pub(crate) fn local_stream_peer_uid(stream: &crate::ipc::LocalStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd as _;
+
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: both out-pointers reference live locals of the expected types.
+    if unsafe { libc::getpeereid(stream.inner().as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(uid)
 }
 
 #[cfg(test)]

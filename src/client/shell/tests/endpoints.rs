@@ -3,7 +3,8 @@ use super::*;
 #[path = "workspace_navigation.rs"]
 mod workspace_navigation;
 use crate::client::endpoint::{
-    ClientEndpointId, ClientEndpointStatus, ProfileId, SavedSshEndpoint,
+    ClientEndpointId, ClientEndpointStatus, ProfileId, SavedMachineKind, SavedMachineSummary,
+    SavedSshEndpoint,
 };
 use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 
@@ -209,6 +210,222 @@ fn machine_diagnostic_badge_reopens_notice_without_collapsing_machine() {
             .find(|endpoint| endpoint.endpoint_id == id)
             .unwrap()
     ));
+}
+
+fn dial_in_summary(id: &str, label: &str, enabled: bool) -> SavedMachineSummary {
+    SavedMachineSummary {
+        id: ProfileId::parse(id).unwrap(),
+        label: label.into(),
+        enabled,
+        kind: SavedMachineKind::DialIn,
+    }
+}
+
+fn machine_row_text(
+    state: &ClientShellState,
+    frame: &crate::client::frame_output::ComposedFrame,
+    id: &ClientEndpointId,
+) -> String {
+    let rect = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| &hit.endpoint_id == id)
+        .unwrap()
+        .rect;
+    let buffer = frame.to_ratatui_buffer().unwrap();
+    (rect.x..rect.right())
+        .map(|x| buffer[(x, rect.y)].symbol())
+        .collect()
+}
+
+fn click_machine_badge(state: &ClientShellState, id: &ClientEndpointId) -> RawInputEvent {
+    let hit = state
+        .hits
+        .machines
+        .iter()
+        .find(|hit| &hit.endpoint_id == id)
+        .unwrap();
+    RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hit.status_badge.x,
+        row: hit.status_badge.y,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+#[test]
+fn saved_machines_of_both_kinds_share_the_machine_list() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let ssh = SavedMachineSummary::from(&remote_profile());
+    let mut laptop = dial_in_summary("fedcba9876543210fedcba9876543210", "Laptop", true);
+    let desktop = dial_in_summary("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Desktop", false);
+    let ssh_id = ClientEndpointId::Ssh(ssh.id.clone());
+    let laptop_id = ClientEndpointId::Ssh(laptop.id.clone());
+    let desktop_id = ClientEndpointId::Ssh(desktop.id.clone());
+    state.set_endpoint_machines(&[ssh.clone(), laptop.clone(), desktop.clone()]);
+    let rows = state
+        .endpoints
+        .iter()
+        .map(|endpoint| {
+            (
+                endpoint.endpoint_id.clone(),
+                endpoint.label.as_str(),
+                endpoint.machine_kind,
+                endpoint.status,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                ClientEndpointId::Local,
+                "Local",
+                None,
+                ClientEndpointStatus::Online
+            ),
+            (
+                ssh_id.clone(),
+                "Build",
+                Some(SavedMachineKind::Ssh),
+                ClientEndpointStatus::Connecting
+            ),
+            (
+                laptop_id.clone(),
+                "Laptop",
+                Some(SavedMachineKind::DialIn),
+                ClientEndpointStatus::Connecting
+            ),
+            (
+                desktop_id.clone(),
+                "Desktop",
+                Some(SavedMachineKind::DialIn),
+                ClientEndpointStatus::Disabled
+            ),
+        ]
+    );
+
+    // A rename keeps the live machine; it renders and navigates like SSH machines.
+    state.set_endpoint_status(&laptop_id, ClientEndpointStatus::Online);
+    let mut remote = snapshot();
+    remote.boot_id = "laptop-boot".into();
+    remote.workspaces[0].label = "laptop-workspace".into();
+    state.set_endpoint_snapshot(&laptop_id, Box::new(remote));
+    laptop.label = "Renamed".into();
+    state.set_endpoint_machines(&[ssh.clone(), laptop.clone(), desktop]);
+    assert_eq!(
+        state.endpoint_status(&laptop_id),
+        Some(ClientEndpointStatus::Online)
+    );
+    assert!(state.endpoint_has_snapshot(&laptop_id));
+    let frame = state.compose(120, 40).unwrap();
+    assert!(machine_row_text(&state, &frame, &laptop_id).contains("Renamed"));
+    assert!(state
+        .hits
+        .machines
+        .iter()
+        .any(|hit| hit.endpoint_id == desktop_id));
+
+    state.set_endpoint_machines(&[ssh]);
+    assert!(!state
+        .endpoints
+        .iter()
+        .any(|endpoint| endpoint.endpoint_id == laptop_id));
+}
+
+#[test]
+fn dial_in_machine_diagnostics_point_at_that_machine_and_never_ask_for_auth() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let ssh = SavedMachineSummary::from(&remote_profile());
+    let laptop = dial_in_summary("fedcba9876543210fedcba9876543210", "Laptop", true);
+    let ssh_id = ClientEndpointId::Ssh(ssh.id.clone());
+    let laptop_id = ClientEndpointId::Ssh(laptop.id.clone());
+    state.set_endpoint_machines(&[ssh, laptop]);
+    let auth_error = "Permission denied (publickey,keyboard-interactive).";
+    for id in [&ssh_id, &laptop_id] {
+        state.set_endpoint_status(id, ClientEndpointStatus::Attention);
+        state.set_machine_diagnostic(id, auth_error.into());
+    }
+    let frame = state.compose(120, 40).unwrap();
+    assert!(machine_row_text(&state, &frame, &ssh_id).contains("! auth"));
+    let laptop_row = machine_row_text(&state, &frame, &laptop_id);
+    assert!(!laptop_row.contains("! auth"), "{laptop_row}");
+    assert!(laptop_row.contains("! error"), "{laptop_row}");
+    assert!(!state.machine_diagnostics.required_for(
+        state
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == laptop_id)
+            .unwrap()
+    ));
+
+    let click = click_machine_badge(&state, &laptop_id);
+    assert!(state.handle_raw_events(vec![click]).repaint);
+    let notice = state.visible_endpoint_notice.take().unwrap();
+    assert_eq!(
+        notice.title,
+        "Laptop: waiting for it to dial in. On that machine run `herdr machine dial status`."
+    );
+    assert_eq!(notice.body, auth_error);
+    assert!(!notice.title.contains("reconnect"));
+
+    // An offline machine keeps retrying and explains where to look.
+    state.set_endpoint_status(&laptop_id, ClientEndpointStatus::Reconnecting);
+    state.set_machine_diagnostic(
+        &laptop_id,
+        "offline; waiting for it to dial in (last link error: link was superseded)".into(),
+    );
+    let frame = state.compose(120, 40).unwrap();
+    let laptop_row = machine_row_text(&state, &frame, &laptop_id);
+    assert!(!laptop_row.contains("! auth"), "{laptop_row}");
+    assert!(laptop_row.contains("reconnecting"), "{laptop_row}");
+    let click = click_machine_badge(&state, &laptop_id);
+    state.handle_raw_events(vec![click]);
+    let notice = state.visible_endpoint_notice.take().unwrap();
+    assert!(notice.title.contains("herdr machine dial status"));
+    assert!(notice.body.contains("link was superseded"));
+
+    // A server too old for this hub: update Herdr on that machine.
+    state.set_endpoint_status(&laptop_id, ClientEndpointStatus::Attention);
+    state.set_machine_diagnostic(
+        &laptop_id,
+        "connection was lost; that machine needs a Herdr server update: needs one final update"
+            .into(),
+    );
+    state.compose(120, 40).unwrap();
+    let click = click_machine_badge(&state, &laptop_id);
+    state.handle_raw_events(vec![click]);
+    let notice = state.visible_endpoint_notice.take().unwrap();
+    assert!(notice.title.starts_with("Laptop: "), "{}", notice.title);
+    assert!(notice.title.contains("`herdr update`"), "{}", notice.title);
+
+    // This hub refused the link itself: the fix is here, not on that machine.
+    for hub_side in [
+        "refusing dial-in link directory /state/client/links/fedcba987654: private directory is accessible by other users (expected mode 0700)",
+        "refusing dial-in link socket /state/client/links/fedcba987654/client.sock: it is served by another user",
+        "dial-in link socket path is too long for a Unix socket: /deep/client.sock (set XDG_STATE_HOME to a shorter directory)",
+    ] {
+        state.set_endpoint_status(&laptop_id, ClientEndpointStatus::Attention);
+        state.set_machine_diagnostic(&laptop_id, hub_side.into());
+        state.compose(120, 40).unwrap();
+        let click = click_machine_badge(&state, &laptop_id);
+        state.handle_raw_events(vec![click]);
+        let notice = state.visible_endpoint_notice.take().unwrap();
+        assert_eq!(
+            notice.title,
+            "Laptop: this hub refused the link. Run `herdr machine status fedcba9876543210fedcba9876543210` here."
+        );
+        assert_eq!(notice.body, hub_side);
+    }
+
+    // SSH machines keep their reconnect hint.
+    let click = click_machine_badge(&state, &ssh_id);
+    state.handle_raw_events(vec![click]);
+    let notice = state.visible_endpoint_notice.take().unwrap();
+    assert!(notice
+        .title
+        .contains("herdr machine reconnect 0123456789abcdef0123456789abcdef"));
 }
 
 fn state_with_scrollable_agents() -> (ClientShellState, ClientEndpointId) {

@@ -12,7 +12,9 @@ pub(super) fn command() -> Command {
         .disable_version_flag(true)
         .arg(help_flag())
         .arg(option("session", "NAME").help("Use or create a named persistent session"))
-        .arg(option("machine", "LABEL-OR-ID").help("Run an API command on a saved SSH machine"))
+        .arg(option("machine", "LABEL-OR-ID").help(
+            "Run an API command on a saved machine (SSH, dial-in, or a relay hub's <relay>/<machine>)",
+        ))
         .arg(option("remote", "TARGET").help("Attach through SSH to a remote Herdr server"))
         .arg(
             option("remote-keybindings", "MODE")

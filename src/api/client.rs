@@ -16,6 +16,13 @@ use crate::ipc::LocalStream;
 pub enum ConnectionTarget {
     LocalSession(Option<String>),
     SocketPath(PathBuf),
+    /// A socket inside a directory that must stay private to the effective
+    /// user and be served by a process of that user (for example a dial-in
+    /// machine's link socket). Both are checked on every connection.
+    PrivateSocketPath {
+        socket: PathBuf,
+        private_dir: PathBuf,
+    },
 }
 
 impl ConnectionTarget {
@@ -24,6 +31,7 @@ impl ConnectionTarget {
             Self::LocalSession(None) => crate::api::socket_path(),
             Self::LocalSession(Some(name)) => crate::session::api_socket_path_for(Some(name)),
             Self::SocketPath(path) => path.clone(),
+            Self::PrivateSocketPath { socket, .. } => socket.clone(),
         }
     }
 }
@@ -121,8 +129,34 @@ impl ApiClient {
     }
 
     fn connect(&self) -> io::Result<LocalStream> {
-        crate::ipc::connect_local_stream(&self.socket_path())
+        match &self.target {
+            ConnectionTarget::PrivateSocketPath {
+                socket,
+                private_dir,
+            } => connect_private_socket(socket, private_dir),
+            _ => crate::ipc::connect_local_stream(&self.socket_path()),
+        }
     }
+}
+
+/// Connects to `socket` only while `private_dir` is private to the effective
+/// user, and only to a listener running as that user.
+fn connect_private_socket(
+    socket: &std::path::Path,
+    private_dir: &std::path::Path,
+) -> io::Result<LocalStream> {
+    crate::platform::verify_private_directory(private_dir)?;
+    let stream = crate::ipc::connect_local_stream(socket)?;
+    if !crate::platform::local_stream_peer_is_current_user(&stream)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing {}: it is served by another user",
+                socket.display()
+            ),
+        ));
+    }
+    Ok(stream)
 }
 
 enum TimeoutKind {
@@ -280,6 +314,44 @@ mod tests {
         );
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_socket_target_checks_the_directory_on_every_connection() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("hpst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::platform::ensure_private_directory(&dir).unwrap();
+        let socket = dir.join("api.sock");
+        let listener = crate::ipc::bind_private_local_listener(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+        });
+        let client = ApiClient::for_target(ConnectionTarget::PrivateSocketPath {
+            socket: socket.clone(),
+            private_dir: dir.clone(),
+        });
+        assert_eq!(client.socket_path(), socket);
+        let mut stream = client.connect().unwrap();
+        stream.write_all(b"{}\n").unwrap();
+        server.join().unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            client.connect().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            client.connect().unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]

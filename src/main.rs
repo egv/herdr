@@ -519,6 +519,12 @@ fn main() -> io::Result<()> {
     if let Some(outcome) = cli::maybe_run_machine(&raw_args) {
         return finish_cli(outcome);
     }
+    if raw_args.get(1).map(String::as_str) == Some("link-accept") {
+        return remote::run_link_accept(&raw_args[2..]);
+    }
+    if raw_args.get(1).map(String::as_str) == Some("link-connect") {
+        return remote::run_link_connect(&raw_args[2..]);
+    }
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
         Err(err) => {
@@ -698,7 +704,7 @@ fn main() -> io::Result<()> {
         println!();
         println!("Options:");
         println!("  --session <name>    Use or create a named persistent session");
-        println!("  --machine <label-or-id>  Run an API command on a saved SSH machine");
+        println!("  --machine <label-or-id>  Run an API command on a saved machine (incl. <relay>/<machine>)");
         println!("  --remote <target>   Attach through SSH to a remote Herdr server");
         println!("  --remote-keybindings <local|server>");
         println!("                      Keybindings for --remote app attach (default: local)");
@@ -792,8 +798,8 @@ fn main() -> io::Result<()> {
     let loaded_config = config::Config::load();
     exit_if_nested_disabled(&loaded_config.config);
 
-    let saved_federation =
-        client::endpoint::EndpointCatalog::load().is_ok_and(|catalog| catalog.has_enabled_ssh());
+    let saved_federation = client::endpoint::EndpointCatalog::load()
+        .is_ok_and(|catalog| catalog.has_enabled_machines());
     if let Err(err) = server::autodetect::auto_detect_launch(saved_federation) {
         eprintln!("herdr: {err}");
         std::process::exit(1);

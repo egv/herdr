@@ -12,6 +12,8 @@ pub(crate) struct ClientEndpointAgentViewProjection {
 pub(crate) struct ClientShellEndpoint {
     pub(crate) endpoint_id: ClientEndpointId,
     pub(crate) label: String,
+    /// How this saved machine is reached; `None` for Local.
+    pub(crate) machine_kind: Option<SavedMachineKind>,
     pub(crate) status: ClientEndpointStatus,
     pub(crate) snapshot: Option<Box<ClientShellSnapshot>>,
     /// Connection generation that produced `snapshot`. `None` is reserved for local tests.
@@ -44,8 +46,20 @@ pub(crate) enum ClientEndpointFocusTarget {
 }
 
 impl ClientShellState {
+    /// SSH-only convenience for tests written before dial-in machines.
+    #[cfg(test)]
     pub(crate) fn set_endpoint_catalog(&mut self, profiles: &[SavedSshEndpoint]) {
-        let mut next = Vec::with_capacity(profiles.len().saturating_add(1));
+        let machines = profiles
+            .iter()
+            .map(SavedMachineSummary::from)
+            .collect::<Vec<_>>();
+        self.set_endpoint_machines(&machines);
+    }
+
+    /// Replaces the saved machines shown after Local, keeping the live state
+    /// of machines that stay enabled.
+    pub(crate) fn set_endpoint_machines(&mut self, machines: &[SavedMachineSummary]) {
+        let mut next = Vec::with_capacity(machines.len().saturating_add(1));
         let local = self
             .endpoints
             .iter()
@@ -53,18 +67,21 @@ impl ClientShellState {
             .cloned()
             .unwrap_or_else(local_endpoint);
         next.push(local);
-        for profile in profiles {
+        for profile in machines {
             let endpoint_id = ClientEndpointId::Ssh(profile.id.clone());
             let previous = self
                 .endpoints
                 .iter()
                 .find(|endpoint| endpoint.endpoint_id == endpoint_id)
                 .filter(|endpoint| {
-                    profile.enabled && endpoint.status != ClientEndpointStatus::Disabled
+                    profile.enabled
+                        && endpoint.status != ClientEndpointStatus::Disabled
+                        && endpoint.machine_kind == Some(profile.kind)
                 });
             next.push(ClientShellEndpoint {
                 endpoint_id,
                 label: profile.label.clone(),
+                machine_kind: Some(profile.kind),
                 status: previous.map_or(
                     if profile.enabled {
                         ClientEndpointStatus::Connecting
@@ -733,6 +750,7 @@ pub(super) fn local_endpoint() -> ClientShellEndpoint {
     ClientShellEndpoint {
         endpoint_id: ClientEndpointId::Local,
         label: "Local".into(),
+        machine_kind: None,
         status: ClientEndpointStatus::Online,
         snapshot: None,
         snapshot_generation: None,

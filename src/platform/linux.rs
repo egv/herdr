@@ -29,6 +29,11 @@ mod config_file_tests;
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 
+mod dial_service;
+pub(crate) use dial_service::{
+    dial_service_install, dial_service_installed, dial_service_status, dial_service_uninstall,
+};
+
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
 const PROCESS_DETECTION_ENV_VAR: &str = "HERDR_PROCESS_DETECTION";
 const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
@@ -1160,6 +1165,35 @@ fn process_session_id(pid: u32) -> Option<i32> {
     let rest = stat.get(stat.rfind(')')? + 2..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
     fields.get(3)?.parse().ok()
+}
+
+/// Effective uid of the process on the other end of a local socket (SO_PEERCRED).
+pub(crate) fn local_stream_peer_uid(stream: &crate::ipc::LocalStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd as _;
+
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the buffer and length describe a live, correctly sized ucred.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.inner().as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SO_PEERCRED returned truncated credentials",
+        ));
+    }
+    Ok(credentials.uid)
 }
 
 #[cfg(test)]
